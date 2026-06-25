@@ -41,6 +41,14 @@ class TranslinkService {
   static DateTime? _feedFetchedAt;
   static const _feedTtl = Duration(seconds: 30);
 
+  /// Call when the API key changes so the next lookup re-tries the live feed
+  /// instead of serving a stale scheduled-mode result.
+  static void clearCache() {
+    _cache.clear();
+    _feedBytes = null;
+    _feedFetchedAt = null;
+  }
+
   static Future<ArrivalResult> getArrivals(String stopCode, {bool forceRefresh = false}) async {
     if (!forceRefresh) {
       final cached = _cache[stopCode];
@@ -128,6 +136,23 @@ class TranslinkService {
     final result = ArrivalResult(arrivals, ArrivalMode.scheduled);
     _cache[stopCode] = (result, DateTime.now());
     return result;
+  }
+
+  /// Diagnostic for the Settings screen — bypasses caches, reports the raw outcome.
+  static Future<String> testConnection() async {
+    final apiKey = await ApiKeyService.getKey();
+    if (apiKey == null) return 'No API key saved';
+    try {
+      final url = Uri.parse('${Config.transitRtUrl}?apikey=$apiKey');
+      final resp = await http.get(url).timeout(const Duration(seconds: 8));
+      if (resp.statusCode == 200) {
+        return 'Success — received ${resp.bodyBytes.length} bytes';
+      }
+      final body = resp.body.length > 300 ? resp.body.substring(0, 300) : resp.body;
+      return 'HTTP ${resp.statusCode}: $body';
+    } catch (e) {
+      return 'Error: $e';
+    }
   }
 
   static Future<Uint8List?> _getFeed({bool forceRefresh = false}) async {

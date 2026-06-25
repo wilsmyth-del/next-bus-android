@@ -5,14 +5,15 @@ import 'screens/settings_screen.dart';
 import 'services/api_key_service.dart';
 
 class NavShell extends StatefulWidget {
-  const NavShell({super.key});
+  final int initialIndex;
+  const NavShell({super.key, this.initialIndex = 0});
 
   @override
   State<NavShell> createState() => _NavShellState();
 }
 
 class _NavShellState extends State<NavShell> {
-  int _currentIndex = 0;
+  late int _currentIndex = widget.initialIndex;
   final GlobalKey<FavoritesScreenState> _favKey = GlobalKey();
 
   @override

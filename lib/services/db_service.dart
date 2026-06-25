@@ -236,6 +236,51 @@ class DbService {
         where: 'stop_code = ?', whereArgs: [stopCode]);
   }
 
+  /// Diagnostic for the Settings screen — exposes the day-matching internals
+  /// so a calendar-filter bug can be seen directly instead of guessed at.
+  static Future<String> diagnoseSchedule(String stopCode) async {
+    final db = await database;
+    final stopRows = await db.query('stops',
+        where: 'stop_code = ?', whereArgs: [stopCode], limit: 1);
+    if (stopRows.isEmpty) return 'Stop $stopCode not found in local DB';
+    final stopId = stopRows.first['stop_id'] as String;
+
+    final now = DateTime.now();
+    final todayStr = '${now.year}'
+        '${now.month.toString().padLeft(2, '0')}'
+        '${now.day.toString().padLeft(2, '0')}';
+    const dayNames = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'];
+    final dowCol = dayNames[now.weekday - 1];
+    final nowTime = '${now.hour.toString().padLeft(2, '0')}'
+        ':${now.minute.toString().padLeft(2, '0')}'
+        ':${now.second.toString().padLeft(2, '0')}';
+
+    const padExpr = "(CASE WHEN length(st.departure_time) = 7 THEN '0' || st.departure_time ELSE st.departure_time END)";
+
+    final calMatch = await db.rawQuery('''
+      SELECT COUNT(*) AS n FROM calendar
+      WHERE $dowCol = 1 AND start_date <= ? AND end_date >= ?
+    ''', [todayStr, todayStr]);
+    final calTotal = await db.rawQuery('SELECT COUNT(*) AS n FROM calendar');
+    final calDateRange = await db.rawQuery('SELECT MIN(start_date) AS lo, MAX(end_date) AS hi FROM calendar');
+    final filteredRows = await db.rawQuery('''
+      SELECT COUNT(*) AS n FROM stop_times st JOIN trips t ON st.trip_id = t.trip_id
+      WHERE st.stop_id = ? AND $padExpr >= ?
+        AND t.service_id IN (SELECT service_id FROM calendar WHERE $dowCol = 1 AND start_date <= ? AND end_date >= ?)
+    ''', [stopId, nowTime, todayStr, todayStr]);
+    final unfilteredRows = await db.rawQuery('''
+      SELECT st.departure_time AS dep, t.service_id AS sid FROM stop_times st JOIN trips t ON st.trip_id = t.trip_id
+      WHERE st.stop_id = ? AND $padExpr >= ?
+      ORDER BY $padExpr LIMIT 5
+    ''', [stopId, nowTime]);
+
+    return 'day=$dowCol todayStr=$todayStr nowTime=$nowTime\n'
+        'calendar rows total=${calTotal.first['n']} matching today=${calMatch.first['n']}\n'
+        'calendar date range: ${calDateRange.first['lo']} to ${calDateRange.first['hi']}\n'
+        'stop_times matched via calendar filter=${filteredRows.first['n']}\n'
+        'next 5 unfiltered (dep,service_id)=${unfilteredRows.map((r) => '${r['dep']}/${r['sid']}').join(', ')}';
+  }
+
   static Future<List<Map<String, dynamic>>> getScheduledArrivals(String stopCode) async {
     final db = await database;
 
@@ -254,6 +299,12 @@ class DbService {
         ':${now.minute.toString().padLeft(2, '0')}'
         ':${now.second.toString().padLeft(2, '0')}';
 
+    // GTFS often stores single-digit-hour departure times unpadded ("7:15:00"
+    // instead of "07:15:00"). Plain string comparison/ordering sorts those
+    // after any "1X:" or "2X:" time, hiding genuinely-due early buses. Pad
+    // before comparing/ordering so string sort matches actual time order.
+    const padExpr = "(CASE WHEN length(st.departure_time) = 7 THEN '0' || st.departure_time ELSE st.departure_time END)";
+
     // Single query — calendar logic fully in SQL to avoid intermediate state bugs
     List<Map<String, dynamic>> rows = await db.rawQuery('''
       SELECT st.trip_id, st.departure_time, r.route_short_name, t.headsign
@@ -261,7 +312,7 @@ class DbService {
       JOIN trips t ON st.trip_id = t.trip_id
       JOIN routes r ON t.route_id = r.route_id
       WHERE st.stop_id = ?
-        AND st.departure_time >= ?
+        AND $padExpr >= ?
         AND (
           t.service_id IN (
             SELECT service_id FROM calendar
@@ -276,7 +327,7 @@ class DbService {
           SELECT service_id FROM calendar_dates
           WHERE date = ? AND exception_type = 2
         )
-      ORDER BY st.departure_time
+      ORDER BY $padExpr
       LIMIT 30
     ''', [stopId, nowTime, todayStr, todayStr, todayStr, todayStr]);
 
@@ -291,8 +342,8 @@ class DbService {
           FROM stop_times st
           JOIN trips t ON st.trip_id = t.trip_id
           JOIN routes r ON t.route_id = r.route_id
-          WHERE st.stop_id = ? AND st.departure_time >= ?
-          ORDER BY st.departure_time
+          WHERE st.stop_id = ? AND $padExpr >= ?
+          ORDER BY $padExpr
           LIMIT 30
         ''', [stopId, nowTime]);
       }
