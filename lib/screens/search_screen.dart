@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../services/api_key_service.dart';
 import '../services/db_service.dart';
 import '../services/gtfs_service.dart';
 import 'arrivals_screen.dart';
@@ -14,6 +15,7 @@ class SearchScreen extends StatefulWidget {
 class _SearchScreenState extends State<SearchScreen> {
   bool _loading = true;
   bool _updating = false;
+  bool _liteMode = false;
   String _status = 'Checking local data...';
   String? _error;
   FeedInfo? _pendingUpdate;
@@ -40,8 +42,18 @@ class _SearchScreenState extends State<SearchScreen> {
       _pendingUpdate = null;
     });
     try {
+      final liteMode = await ApiKeyService.getLiteMode();
+      if (mounted) setState(() => _liteMode = liteMode);
+
       final hasData = await DbService.hasStops();
       if (!hasData) {
+        if (liteMode) {
+          if (mounted) setState(() {
+            _loading = false;
+            _error = 'Lite mode is on — no schedule data downloaded yet.\n\nConnect to Wi-Fi, turn off lite mode in Settings, and reopen the app.';
+          });
+          return;
+        }
         setState(() => _status = 'Finding latest GTFS feed...');
         final feed = await GtfsService.findLatestFeed();
         if (feed == null) throw Exception('GTFS feed not found');
@@ -51,8 +63,8 @@ class _SearchScreenState extends State<SearchScreen> {
             if (mounted) setState(() => _status = s);
           },
         );
-      } else {
-        // Stops exist — check quietly for an update
+      } else if (!liteMode) {
+        // Stops exist and not lite mode — check quietly for an update
         setState(() => _status = 'Checking for updates...');
         final update = await GtfsService.checkForUpdate();
         if (mounted) setState(() => _pendingUpdate = update);
@@ -162,7 +174,7 @@ class _SearchScreenState extends State<SearchScreen> {
               MaterialPageRoute(builder: (_) => const CameraScreen()),
             ),
           ),
-          if (!_loading)
+          if (!_loading && !_liteMode)
             _updating
                 ? const Padding(
                     padding: EdgeInsets.all(16),

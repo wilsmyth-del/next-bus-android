@@ -57,8 +57,11 @@ class TranslinkService {
       }
     }
 
+    // Skip live feed entirely in lite mode
+    final liteMode = await ApiKeyService.getLiteMode();
+
     // Try direct TransLink GTFS-RT
-    try {
+    if (!liteMode) try {
       final feedBytes = await _getFeed(forceRefresh: forceRefresh);
       if (feedBytes != null) {
         final stopRow = await DbService.lookupStop(stopCode);

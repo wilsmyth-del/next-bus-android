@@ -15,6 +15,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _loading = true;
   bool _saved = false;
   bool _hasKey = false;
+  bool _liteMode = false;
   bool _testing = false;
   String? _testResult;
   final _diagStopController = TextEditingController();
@@ -36,10 +37,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Future<void> _load() async {
     final key = await ApiKeyService.getKey();
+    final liteMode = await ApiKeyService.getLiteMode();
     if (mounted) {
       setState(() {
         _controller.text = key ?? '';
         _hasKey = key != null;
+        _liteMode = liteMode;
         _loading = false;
       });
     }
@@ -99,6 +102,32 @@ class _SettingsScreenState extends State<SettingsScreen> {
           : ListView(
               padding: const EdgeInsets.all(16),
               children: [
+                const Text(
+                  'Data usage',
+                  style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16),
+                ),
+                const SizedBox(height: 8),
+                Container(
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF1A1D27),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: SwitchListTile(
+                    title: const Text('Lite mode', style: TextStyle(color: Colors.white)),
+                    subtitle: const Text(
+                      'Block GTFS downloads and live arrivals on mobile data',
+                      style: TextStyle(color: Colors.white54, fontSize: 12),
+                    ),
+                    value: _liteMode,
+                    activeColor: const Color(0xFF60A5FA),
+                    onChanged: (val) async {
+                      await ApiKeyService.setLiteMode(val);
+                      TranslinkService.clearCache();
+                      if (mounted) setState(() => _liteMode = val);
+                    },
+                  ),
+                ),
+                const SizedBox(height: 24),
                 const Text(
                   'TransLink API Key',
                   style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16),
