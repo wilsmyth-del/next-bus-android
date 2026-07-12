@@ -141,6 +141,23 @@ class TranslinkService {
     return result;
   }
 
+  /// Diagnostic for the Settings screen — bypasses caches, reports the raw outcome.
+  static Future<String> testConnection() async {
+    final apiKey = await ApiKeyService.getKey();
+    if (apiKey == null) return 'No API key saved';
+    try {
+      final url = Uri.parse('${Config.transitRtUrl}?apikey=$apiKey');
+      final resp = await http.get(url).timeout(const Duration(seconds: 8));
+      if (resp.statusCode == 200) {
+        return 'Success — received ${resp.bodyBytes.length} bytes';
+      }
+      final body = resp.body.length > 300 ? resp.body.substring(0, 300) : resp.body;
+      return 'HTTP ${resp.statusCode}: $body';
+    } catch (e) {
+      return 'Error: $e';
+    }
+  }
+
   static Future<Uint8List?> _getFeed({bool forceRefresh = false}) async {
     if (!forceRefresh && _feedBytes != null && _feedFetchedAt != null &&
         DateTime.now().difference(_feedFetchedAt!) < _feedTtl) {

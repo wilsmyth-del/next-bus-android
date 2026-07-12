@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
 import '../services/api_key_service.dart';
 import '../services/translink_service.dart';
 import '../services/db_service.dart';
-import '../services/gtfs_service.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -17,8 +16,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _saved = false;
   bool _hasKey = false;
   bool _liteMode = false;
-  bool _refreshingGtfs = false;
-  String? _gtfsDate;
+  bool _testing = false;
+  String? _testResult;
+  final _diagStopController = TextEditingController();
+  bool _diagnosing = false;
+  String? _diagResult;
 
   @override
   void initState() {
@@ -29,62 +31,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
   @override
   void dispose() {
     _controller.dispose();
+    _diagStopController.dispose();
     super.dispose();
   }
 
   Future<void> _load() async {
     final key = await ApiKeyService.getKey();
     final liteMode = await ApiKeyService.getLiteMode();
-    final gtfsDate = await DbService.getGtfsDate();
     if (mounted) {
       setState(() {
         _controller.text = key ?? '';
         _hasKey = key != null;
         _liteMode = liteMode;
-        _gtfsDate = gtfsDate;
         _loading = false;
       });
-    }
-  }
-
-  Future<void> _refreshGtfs() async {
-    setState(() => _refreshingGtfs = true);
-    try {
-      final feed = await GtfsService.findLatestFeed();
-      if (feed == null) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('No GTFS feed found')),
-          );
-        }
-        return;
-      }
-      if (_gtfsDate == feed.date) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Already up to date (${feed.date})')),
-          );
-        }
-        return;
-      }
-      await GtfsService.downloadAndBuild(
-        feed: feed,
-        onStatus: (_) {},
-      );
-      if (mounted) {
-        setState(() => _gtfsDate = feed.date);
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Updated to ${feed.date}')),
-        );
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Update failed: $e')),
-        );
-      }
-    } finally {
-      if (mounted) setState(() => _refreshingGtfs = false);
     }
   }
 
@@ -99,6 +59,34 @@ class _SettingsScreenState extends State<SettingsScreen> {
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('API key saved')),
     );
+  }
+
+  Future<void> _testConnection() async {
+    setState(() {
+      _testing = true;
+      _testResult = null;
+    });
+    final result = await TranslinkService.testConnection();
+    if (!mounted) return;
+    setState(() {
+      _testing = false;
+      _testResult = result;
+    });
+  }
+
+  Future<void> _diagnoseSchedule() async {
+    final stopCode = _diagStopController.text.trim();
+    if (stopCode.isEmpty) return;
+    setState(() {
+      _diagnosing = true;
+      _diagResult = null;
+    });
+    final result = await DbService.diagnoseSchedule(stopCode);
+    if (!mounted) return;
+    setState(() {
+      _diagnosing = false;
+      _diagResult = result;
+    });
   }
 
   @override
@@ -202,35 +190,75 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
                   child: Text(_saved ? 'Saved' : 'Save'),
                 ),
-                const SizedBox(height: 32),
-                const Text(
-                  'Transit data',
-                  style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16),
-                ),
                 const SizedBox(height: 8),
-                Text(
-                  _gtfsDate != null
-                      ? 'Current schedule data: $_gtfsDate'
-                      : 'No schedule data downloaded yet',
-                  style: const TextStyle(color: Colors.white54, fontSize: 13),
-                ),
-                const SizedBox(height: 12),
                 OutlinedButton(
-                  onPressed: _refreshingGtfs ? null : _refreshGtfs,
+                  onPressed: _testing ? null : _testConnection,
                   style: OutlinedButton.styleFrom(
                     foregroundColor: Colors.white70,
                     side: const BorderSide(color: Colors.white24),
                     padding: const EdgeInsets.symmetric(vertical: 14),
                     minimumSize: const Size(double.infinity, 0),
                   ),
-                  child: _refreshingGtfs
+                  child: _testing
                       ? const SizedBox(
                           width: 18,
                           height: 18,
                           child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF60A5FA)),
                         )
-                      : const Text('Refresh Transit Data'),
+                      : const Text('Test Connection'),
                 ),
+                if (_testResult != null) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    _testResult!,
+                    style: const TextStyle(color: Colors.white54, fontSize: 12),
+                  ),
+                ],
+                const SizedBox(height: 24),
+                const Text(
+                  'Schedule diagnostic',
+                  style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16),
+                ),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: _diagStopController,
+                  keyboardType: TextInputType.number,
+                  style: const TextStyle(color: Colors.white),
+                  decoration: InputDecoration(
+                    hintText: 'Stop code to inspect',
+                    hintStyle: const TextStyle(color: Colors.white38),
+                    filled: true,
+                    fillColor: const Color(0xFF1A1D27),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: BorderSide.none,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                OutlinedButton(
+                  onPressed: _diagnosing ? null : _diagnoseSchedule,
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.white70,
+                    side: const BorderSide(color: Colors.white24),
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    minimumSize: const Size(double.infinity, 0),
+                  ),
+                  child: _diagnosing
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF60A5FA)),
+                        )
+                      : const Text('Inspect Schedule Query'),
+                ),
+                if (_diagResult != null) ...[
+                  const SizedBox(height: 8),
+                  SelectableText(
+                    _diagResult!,
+                    style: const TextStyle(color: Colors.white54, fontSize: 12),
+                  ),
+                ],
                 const SizedBox(height: 32),
                 const Text(
                   'How to get a key',
