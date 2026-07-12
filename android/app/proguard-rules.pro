@@ -6,11 +6,15 @@
 -dontwarn com.google.mlkit.vision.text.japanese.**
 -dontwarn com.google.mlkit.vision.text.korean.**
 
-# Deobfuscated the actual release-mode NPE trace via R8's mapping.txt on
-# 2026-07-12 — the classes really being stripped are in mlkit_common and
-# mlkit_vision_common (zzmj/zzsr/LazyInstanceMap), not vision.text at all.
-# The original -keep guess (below, removed) targeted the wrong package
-# and never touched the real problem.
--keep class com.google.mlkit.common.** { *; }
+# Deobfuscated two successive release-mode NPE traces via R8's mapping.txt
+# on 2026-07-12. R8 strips several distinct internal ML Kit implementation
+# packages that aren't reachable by normal reflection analysis — each fix
+# below was confirmed necessary by decoding an actual crash trace, not
+# guessed. com.google.mlkit.** covers vision.text (incl. its .internal
+# subpackage) and common/sdkinternal in one rule; the com.google.android.gms
+# ones are a separate top-level path and need listing individually.
+-keep class com.google.mlkit.** { *; }
 -keep class com.google.android.gms.internal.mlkit_common.** { *; }
 -keep class com.google.android.gms.internal.mlkit_vision_common.** { *; }
+-keep class com.google.android.gms.internal.mlkit_vision_text_common.** { *; }
+-keep class com.google.android.gms.internal.mlkit_vision_text_bundled_latin.** { *; }
