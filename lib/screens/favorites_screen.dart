@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_slidable/flutter_slidable.dart';
 import '../services/db_service.dart';
 import 'arrivals_screen.dart';
 
@@ -26,8 +27,8 @@ class FavoritesScreenState extends State<FavoritesScreen> {
   }
 
   Future<void> _remove(String stopCode) async {
+    setState(() => _favourites.removeWhere((f) => f['stop_code'] == stopCode));
     await DbService.removeFavourite(stopCode);
-    await _load();
   }
 
   Future<void> _rename(String stopCode, String currentName) async {
@@ -104,17 +105,21 @@ class FavoritesScreenState extends State<FavoritesScreen> {
                 final stop = _favourites[i];
                 final stopCode = stop['stop_code'] as String;
                 final stopName = stop['stop_name'] as String;
-                return Dismissible(
+                return Slidable(
                   key: Key(stopCode),
-                  direction: DismissDirection.endToStart,
-                  background: Container(
-                    alignment: Alignment.centerRight,
-                    padding: const EdgeInsets.only(right: 24),
-                    color: Colors.red.shade900,
-                    child: const Icon(Icons.delete_outline,
-                        color: Colors.white70),
+                  endActionPane: ActionPane(
+                    motion: const ScrollMotion(),
+                    extentRatio: 0.28,
+                    children: [
+                      SlidableAction(
+                        onPressed: (_) => _remove(stopCode),
+                        backgroundColor: Colors.red.shade900,
+                        foregroundColor: Colors.white70,
+                        icon: Icons.delete_outline,
+                        label: 'Remove',
+                      ),
+                    ],
                   ),
-                  onDismissed: (_) => _remove(stopCode),
                   child: ListTile(
                     leading:
                         const Icon(Icons.star, color: Color(0xFF60A5FA)),
@@ -143,7 +148,7 @@ class FavoritesScreenState extends State<FavoritesScreen> {
                 const Padding(
                   padding: EdgeInsets.symmetric(vertical: 12),
                   child: Text(
-                    'Hold to rename  ·  Swipe to remove',
+                    'Hold to rename  ·  Swipe to reveal remove',
                     style: TextStyle(color: Colors.white24, fontSize: 11),
                     textAlign: TextAlign.center,
                   ),

@@ -216,7 +216,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
                 const SizedBox(height: 12),
                 OutlinedButton(
-                  onPressed: _refreshingGtfs ? null : _refreshGtfs,
+                  onPressed: (_refreshingGtfs || _liteMode) ? null : _refreshGtfs,
                   style: OutlinedButton.styleFrom(
                     foregroundColor: Colors.white70,
                     side: const BorderSide(color: Colors.white24),
@@ -231,6 +231,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         )
                       : const Text('Refresh Transit Data'),
                 ),
+                if (_liteMode) ...[
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Turn off Lite mode above to refresh schedule data',
+                    style: TextStyle(color: Colors.white38, fontSize: 12),
+                  ),
+                ],
                 const SizedBox(height: 32),
                 const Text(
                   'How to get a key',
