@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'screens/camera_screen.dart';
+import 'screens/home_screen.dart';
 
 void main() {
   runApp(const NextBusApp());
@@ -21,7 +21,7 @@ class NextBusApp extends StatelessWidget {
         ),
         scaffoldBackgroundColor: const Color(0xFF0F1117),
       ),
-      home: const CameraScreen(isLanding: true),
+      home: const HomeScreen(),
     );
   }
 }
