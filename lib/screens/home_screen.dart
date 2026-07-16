@@ -52,7 +52,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _hasStops = await DbService.hasStops();
 
     if (!_hasStops) {
-      // First-launch GTFS download flow (mirrors search_screen.dart _init).
+      // First-launch GTFS download flow.
       if (_liteMode) {
         setState(() {
           _loading = false;
@@ -244,8 +244,16 @@ class _HomeScreenState extends State<HomeScreen> {
         builder: (_) => ArrivalsScreen(stopCode: stopCode, stopName: stopName),
       ),
     );
+    // Clear the search so returning from arrivals lands back on favourites,
+    // not stuck on stale search results with no way back.
+    _searchController.clear();
     // Reload in case a stop was starred/unstarred while viewing arrivals.
     await _loadFavourites();
+  }
+
+  void _clearSearch() {
+    _searchController.clear();
+    setState(() => _searchResults = []);
   }
 
   // ── build ─────────────────────────────────────────────────────────────────
@@ -336,6 +344,13 @@ class _HomeScreenState extends State<HomeScreen> {
               hintText: 'Enter stop number',
               hintStyle: const TextStyle(color: Colors.white38),
               prefixIcon: const Icon(Icons.search, color: Colors.white38),
+              suffixIcon: _searchController.text.isNotEmpty
+                  ? IconButton(
+                      icon: const Icon(Icons.clear, color: Colors.white38),
+                      tooltip: 'Back to favourites',
+                      onPressed: _clearSearch,
+                    )
+                  : null,
               filled: true,
               fillColor: _surface,
               border: OutlineInputBorder(
