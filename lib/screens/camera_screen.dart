@@ -1,13 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
-import '../nav_shell.dart';
 import '../services/db_service.dart';
 import 'arrivals_screen.dart';
 
 class CameraScreen extends StatefulWidget {
-  final bool isLanding;
-  const CameraScreen({super.key, this.isLanding = false});
+  const CameraScreen({super.key});
 
   @override
   State<CameraScreen> createState() => _CameraScreenState();
@@ -173,31 +171,9 @@ class _CameraScreenState extends State<CameraScreen> {
                         style:
                             const TextStyle(color: Colors.orangeAccent)),
                   ],
-                  if (widget.isLanding) ...[
-                    const SizedBox(height: 32),
-                    const Text('Or use the menu below for search, favourites, or settings',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(color: Colors.white38, fontSize: 12)),
-                  ],
                 ],
               ),
       ),
-      bottomNavigationBar: widget.isLanding
-          ? BottomNavigationBar(
-              currentIndex: 0,
-              onTap: (i) => Navigator.of(context).pushReplacement(
-                MaterialPageRoute(builder: (_) => NavShell(initialIndex: i)),
-              ),
-              backgroundColor: const Color(0xFF1A1D27),
-              selectedItemColor: const Color(0xFF60A5FA),
-              unselectedItemColor: Colors.white54,
-              items: const [
-                BottomNavigationBarItem(icon: Icon(Icons.star_outline), label: 'Favourites'),
-                BottomNavigationBarItem(icon: Icon(Icons.search), label: 'Search'),
-                BottomNavigationBarItem(icon: Icon(Icons.settings_outlined), label: 'Settings'),
-              ],
-            )
-          : null,
     );
   }
 }
