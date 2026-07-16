@@ -460,14 +460,20 @@ class _HomeScreenState extends State<HomeScreen> {
             extentRatio: 0.5,
             children: [
               SlidableAction(
-                onPressed: (_) => _renameFavourite(stopCode, stopName),
+                onPressed: (ctx) {
+                  Slidable.of(ctx)?.close();
+                  _renameFavourite(stopCode, stopName);
+                },
                 backgroundColor: _accent,
                 foregroundColor: Colors.white,
                 icon: Icons.edit,
                 label: 'Rename',
               ),
               SlidableAction(
-                onPressed: (_) => _deleteFavourite(stopCode),
+                onPressed: (ctx) {
+                  Slidable.of(ctx)?.close();
+                  _deleteFavourite(stopCode);
+                },
                 backgroundColor: Colors.red.shade700,
                 foregroundColor: Colors.white,
                 icon: Icons.delete,
@@ -482,7 +488,6 @@ class _HomeScreenState extends State<HomeScreen> {
                 style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
             subtitle: Text(stopName, style: const TextStyle(color: Colors.white54, fontSize: 12)),
             onTap: () => _openArrivals(stopCode, stopName),
-            onLongPress: () => _renameFavourite(stopCode, stopName),
           ),
         );
       },
