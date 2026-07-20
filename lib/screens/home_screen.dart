@@ -460,20 +460,14 @@ class _HomeScreenState extends State<HomeScreen> {
             extentRatio: 0.5,
             children: [
               SlidableAction(
-                onPressed: (ctx) {
-                  Slidable.of(ctx)?.close();
-                  _renameFavourite(stopCode, stopName);
-                },
+                onPressed: (_) => _renameFavourite(stopCode, stopName),
                 backgroundColor: _accent,
                 foregroundColor: Colors.white,
                 icon: Icons.edit,
                 label: 'Rename',
               ),
               SlidableAction(
-                onPressed: (ctx) {
-                  Slidable.of(ctx)?.close();
-                  _deleteFavourite(stopCode);
-                },
+                onPressed: (_) => _deleteFavourite(stopCode),
                 backgroundColor: Colors.red.shade700,
                 foregroundColor: Colors.white,
                 icon: Icons.delete,
