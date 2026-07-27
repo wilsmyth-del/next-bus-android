@@ -191,8 +191,36 @@ class _HomeScreenState extends State<HomeScreen> {
   // ── favourites actions ────────────────────────────────────────────────────
 
   Future<void> _deleteFavourite(String stopCode) async {
-    setState(() => _favourites.removeWhere((f) => f['stop_code'] == stopCode));
-    await DbService.removeFavourite(stopCode);
+    // Diagnostic wrap (#309) — two prior fixes were disproven on-device with
+    // no visible error (release builds swallow unhandled exceptions
+    // silently). This surfaces the real failure on-screen instead of
+    // guessing again: either a thrown exception, or a silent no-op where the
+    // DB delete runs but matches zero rows (a stopCode mismatch wouldn't
+    // throw at all, just quietly affect nothing).
+    final removedIndex = _favourites.indexWhere((f) => f['stop_code'] == stopCode);
+    if (removedIndex == -1) return;
+    final removed = _favourites[removedIndex];
+
+    setState(() => _favourites.removeAt(removedIndex));
+
+    try {
+      final rowsAffected = await DbService.removeFavourite(stopCode);
+      if (rowsAffected == 0) {
+        if (mounted) {
+          setState(() => _favourites.insert(removedIndex, removed));
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Delete did not match any row for stop_code=$stopCode')),
+          );
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _favourites.insert(removedIndex, removed));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Delete failed: $e')),
+        );
+      }
+    }
   }
 
   Future<void> _renameFavourite(String stopCode, String currentName) async {

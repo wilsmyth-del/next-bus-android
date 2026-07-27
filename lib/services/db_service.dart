@@ -230,9 +230,9 @@ class DbService {
     );
   }
 
-  static Future<void> removeFavourite(String stopCode) async {
+  static Future<int> removeFavourite(String stopCode) async {
     final db = await database;
-    await db.delete('favourites',
+    return db.delete('favourites',
         where: 'stop_code = ?', whereArgs: [stopCode]);
   }
 
