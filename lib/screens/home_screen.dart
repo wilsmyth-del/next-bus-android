@@ -191,19 +191,33 @@ class _HomeScreenState extends State<HomeScreen> {
   // ── favourites actions ────────────────────────────────────────────────────
 
   Future<void> _deleteFavourite(String stopCode) async {
-    // Diagnostic wrap (#309) — two prior fixes were disproven on-device with
-    // no visible error (release builds swallow unhandled exceptions
-    // silently). This surfaces the real failure on-screen instead of
-    // guessing again: either a thrown exception, or a silent no-op where the
-    // DB delete runs but matches zero rows (a stopCode mismatch wouldn't
-    // throw at all, just quietly affect nothing).
-    final removedIndex = _favourites.indexWhere((f) => f['stop_code'] == stopCode);
-    if (removedIndex == -1) return;
-    final removed = _favourites[removedIndex];
-
-    setState(() => _favourites.removeAt(removedIndex));
+    // Diagnostic wrap (#309), round 2 — the previous try/catch (07-27)
+    // produced NO on-screen message at all on-device, meaning the failure is
+    // upstream of the DB call: either the Slidable tap never reaches this
+    // function, or something throws synchronously before the old try block
+    // (which didn't cover the removeAt/setState above it). This version
+    // fires an immediate, un-missable marker the instant the handler runs,
+    // and wraps the entire function so nothing synchronous can fail silently.
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('DEBUG: delete tapped for $stopCode'), duration: const Duration(seconds: 3)),
+      );
+    }
 
     try {
+      final removedIndex = _favourites.indexWhere((f) => f['stop_code'] == stopCode);
+      if (removedIndex == -1) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('DEBUG: $stopCode not found in local favourites list')),
+          );
+        }
+        return;
+      }
+      final removed = _favourites[removedIndex];
+
+      setState(() => _favourites.removeAt(removedIndex));
+
       final rowsAffected = await DbService.removeFavourite(stopCode);
       if (rowsAffected == 0) {
         if (mounted) {
@@ -213,9 +227,9 @@ class _HomeScreenState extends State<HomeScreen> {
           );
         }
       }
-    } catch (e) {
+    } catch (e, st) {
+      debugPrint('_deleteFavourite failed: $e\n$st');
       if (mounted) {
-        setState(() => _favourites.insert(removedIndex, removed));
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Delete failed: $e')),
         );
