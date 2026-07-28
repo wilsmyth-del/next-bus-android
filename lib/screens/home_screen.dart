@@ -124,8 +124,13 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _loadFavourites() async {
+    // sqflite's query() result is backed by the platform-channel decode and
+    // is not growable/modifiable — wrap in a real growable list so local
+    // removeAt/insert (used for optimistic delete below) don't throw.
     final favs = await DbService.getFavourites();
-    if (mounted) setState(() => _favourites = favs);
+    if (mounted) {
+      setState(() => _favourites = List<Map<String, dynamic>>.from(favs));
+    }
   }
 
   // ── GTFS refresh (AppBar action) ──────────────────────────────────────────
@@ -191,29 +196,9 @@ class _HomeScreenState extends State<HomeScreen> {
   // ── favourites actions ────────────────────────────────────────────────────
 
   Future<void> _deleteFavourite(String stopCode) async {
-    // Diagnostic wrap (#309), round 2 — the previous try/catch (07-27)
-    // produced NO on-screen message at all on-device, meaning the failure is
-    // upstream of the DB call: either the Slidable tap never reaches this
-    // function, or something throws synchronously before the old try block
-    // (which didn't cover the removeAt/setState above it). This version
-    // fires an immediate, un-missable marker the instant the handler runs,
-    // and wraps the entire function so nothing synchronous can fail silently.
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('DEBUG: delete tapped for $stopCode'), duration: const Duration(seconds: 3)),
-      );
-    }
-
     try {
       final removedIndex = _favourites.indexWhere((f) => f['stop_code'] == stopCode);
-      if (removedIndex == -1) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('DEBUG: $stopCode not found in local favourites list')),
-          );
-        }
-        return;
-      }
+      if (removedIndex == -1) return;
       final removed = _favourites[removedIndex];
 
       setState(() => _favourites.removeAt(removedIndex));
