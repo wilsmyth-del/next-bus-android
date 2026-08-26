@@ -236,38 +236,81 @@ class DbService {
         where: 'stop_code = ?', whereArgs: [stopCode]);
   }
 
-  static Future<List<Map<String, dynamic>>> getScheduledArrivals(String stopCode) async {
-    final db = await database;
+  /// How far ahead a schedule lookup reports. GTFS keeps post-midnight trips in
+  /// the *previous* service day as "24:xx"/"25:xx", so with no horizon a stop
+  /// whose last bus has already gone will cheerfully answer with tomorrow's
+  /// first bus and render it as "1470m" — arithmetically right, useless on
+  /// screen. Six hours lets a genuine 3am gap read as "no upcoming buses" while
+  /// still finding the first bus of the morning.
+  static const Duration scheduleHorizon = Duration(hours: 6);
 
-    final stopRows = await db.query('stops',
-        where: 'stop_code = ?', whereArgs: [stopCode], limit: 1);
-    if (stopRows.isEmpty) return [];
-    final stopId = stopRows.first['stop_id'] as String;
+  /// No real feed schedules a trip beyond this point in its service day. Past
+  /// it, yesterday's service day cannot contribute anything and is skipped.
+  static const int _maxServiceDaySecs = 30 * 3600; // 30:00:00
 
-    final now = DateTime.now();
-    final todayStr = '${now.year}'
-        '${now.month.toString().padLeft(2, '0')}'
-        '${now.day.toString().padLeft(2, '0')}';
-    const dayNames = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'];
-    final dowCol = dayNames[now.weekday - 1];
-    final nowTime = '${now.hour.toString().padLeft(2, '0')}'
-        ':${now.minute.toString().padLeft(2, '0')}'
-        ':${now.second.toString().padLeft(2, '0')}';
+  static const List<String> _dayNames = [
+    'monday','tuesday','wednesday','thursday','friday','saturday','sunday',
+  ];
 
-    // GTFS often stores single-digit-hour departure times unpadded ("7:15:00"
-    // instead of "07:15:00"). Plain string comparison/ordering sorts those
-    // after any "1X:" or "2X:" time, hiding genuinely-due early buses. Pad
-    // before comparing/ordering so string sort matches actual time order.
-    const padExpr = "(CASE WHEN length(st.departure_time) = 7 THEN '0' || st.departure_time ELSE st.departure_time END)";
+  // GTFS often stores single-digit-hour departure times unpadded ("7:15:00"
+  // instead of "07:15:00"). Plain string comparison/ordering sorts those
+  // after any "1X:" or "2X:" time, hiding genuinely-due early buses. Pad
+  // before comparing/ordering so string sort matches actual time order.
+  static const String _padExpr =
+      "(CASE WHEN length(st.departure_time) = 7 THEN '0' || st.departure_time ELSE st.departure_time END)";
 
-    // Single query — calendar logic fully in SQL to avoid intermediate state bugs
-    List<Map<String, dynamic>> rows = await db.rawQuery('''
+  /// Formats seconds-since-service-day-midnight as a GTFS time string. Hours
+  /// are allowed past 23 — that is the entire point of the format.
+  static String _gtfsTime(int secs) {
+    final h = secs ~/ 3600;
+    final m = (secs % 3600) ~/ 60;
+    final s = secs % 60;
+    return '${h.toString().padLeft(2, '0')}'
+        ':${m.toString().padLeft(2, '0')}'
+        ':${s.toString().padLeft(2, '0')}';
+  }
+
+  static String _yyyymmdd(DateTime d) =>
+      '${d.year}'
+      '${d.month.toString().padLeft(2, '0')}'
+      '${d.day.toString().padLeft(2, '0')}';
+
+  /// Departures at [stopId] belonging to a single service day.
+  ///
+  /// [serviceDay] is the day the *service* is scheduled under, which for
+  /// post-midnight trips is yesterday, not the date on the clock. [offsetSecs]
+  /// is how far that service day's midnight sits behind today's: 0 for today,
+  /// 86400 for yesterday. The window is shifted by that offset rather than the
+  /// trips being shifted, so every comparison stays in the strings GTFS ships.
+  ///
+  /// Appends onto [into] instead of returning, because two service days merge
+  /// into one list and the caller sorts once at the end.
+  static Future<void> _collectServiceDay({
+    required Database db,
+    required String stopId,
+    required DateTime serviceDay,
+    required int offsetSecs,
+    required int nowSecs,
+    required int horizonSecs,
+    required List<Map<String, dynamic>> into,
+  }) async {
+    final fromSecs = nowSecs + offsetSecs;
+    if (fromSecs > _maxServiceDaySecs) return;
+    final toSecs = horizonSecs + offsetSecs;
+
+    final dateStr = _yyyymmdd(serviceDay);
+    final dowCol = _dayNames[serviceDay.weekday - 1];
+
+    // Calendar logic stays fully in SQL to avoid intermediate state bugs.
+    // dowCol is interpolated from the fixed list above, never from input.
+    final rows = await db.rawQuery('''
       SELECT st.trip_id, st.departure_time, r.route_short_name, t.headsign
       FROM stop_times st
       JOIN trips t ON st.trip_id = t.trip_id
       JOIN routes r ON t.route_id = r.route_id
       WHERE st.stop_id = ?
-        AND $padExpr >= ?
+        AND $_padExpr >= ?
+        AND $_padExpr <= ?
         AND (
           t.service_id IN (
             SELECT service_id FROM calendar
@@ -282,42 +325,33 @@ class DbService {
           SELECT service_id FROM calendar_dates
           WHERE date = ? AND exception_type = 2
         )
-      ORDER BY $padExpr
+      ORDER BY $_padExpr
       LIMIT 30
-    ''', [stopId, nowTime, todayStr, todayStr, todayStr, todayStr]);
+    ''', [
+      stopId,
+      _gtfsTime(fromSecs),
+      _gtfsTime(toSecs),
+      dateStr, dateStr, dateStr, dateStr,
+    ]);
 
-    // Fallback: if calendar filter found nothing but stop has stop_times data,
-    // the service_id pattern is likely non-standard — return unfiltered by service
-    if (rows.isEmpty) {
-      final check = await db.rawQuery(
-          'SELECT 1 FROM stop_times WHERE stop_id = ? LIMIT 1', [stopId]);
-      if (check.isNotEmpty) {
-        rows = await db.rawQuery('''
-          SELECT st.trip_id, st.departure_time, r.route_short_name, t.headsign
-          FROM stop_times st
-          JOIN trips t ON st.trip_id = t.trip_id
-          JOIN routes r ON t.route_id = r.route_id
-          WHERE st.stop_id = ? AND $padExpr >= ?
-          ORDER BY $padExpr
-          LIMIT 30
-        ''', [stopId, nowTime]);
-      }
-    }
-
-    final result = <Map<String, dynamic>>[];
     for (final r in rows) {
       final rawTime = (r['departure_time'] as String).trim();
       final parts = rawTime.split(':');
       final h = int.tryParse(parts[0]) ?? 0;
       final m = int.tryParse(parts.length > 1 ? parts[1] : '0') ?? 0;
+      final s = int.tryParse(parts.length > 2 ? parts[2] : '0') ?? 0;
+
+      // "24:30" and "00:30" are the same clock face; which service day the trip
+      // belongs to is what tells them apart, and offsetSecs already carries it.
       final displayH = h % 24;
       final displayTime =
           '${displayH.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}';
-      final depSecs = h * 3600 + m * 60;
-      final nowSecs = now.hour * 3600 + now.minute * 60 + now.second;
-      final minutesAway = (depSecs - nowSecs) ~/ 60;
+
+      final depSecs = h * 3600 + m * 60 + s;
+      final minutesAway = (depSecs - offsetSecs - nowSecs) ~/ 60;
       if (minutesAway < 0) continue;
-      result.add({
+
+      into.add({
         'trip_id':      r['trip_id'] ?? '',
         'route':        r['route_short_name'] ?? '',
         'headsign':     r['headsign'] ?? '',
@@ -325,7 +359,51 @@ class DbService {
         'minutes_away': minutesAway,
       });
     }
-    return result;
+  }
+
+  /// Upcoming scheduled departures at [stopCode], newest-first by time.
+  ///
+  /// Two service days can contribute at any instant: today's, and yesterday's
+  /// via its post-midnight "24:xx" trips. Both are queried and merged.
+  ///
+  /// Deliberately has no "calendar matched nothing, so return everything"
+  /// fallback. That path used to drop the service filter entirely and hand back
+  /// trips from any day of the week — Sunday buses on a Tuesday, indistinguish-
+  /// able from real ones. An empty list is the honest answer when the schedule
+  /// has expired or the stop genuinely has no service left today.
+  static Future<List<Map<String, dynamic>>> getScheduledArrivals(String stopCode) async {
+    final db = await database;
+
+    final stopRows = await db.query('stops',
+        where: 'stop_code = ?', whereArgs: [stopCode], limit: 1);
+    if (stopRows.isEmpty) return [];
+    final stopId = stopRows.first['stop_id'] as String;
+
+    final now = DateTime.now();
+    final nowSecs = now.hour * 3600 + now.minute * 60 + now.second;
+    final horizonSecs = nowSecs + scheduleHorizon.inSeconds;
+    final today = DateTime(now.year, now.month, now.day);
+
+    final result = <Map<String, dynamic>>[];
+
+    await _collectServiceDay(
+      db: db, stopId: stopId,
+      serviceDay: today.subtract(const Duration(days: 1)),
+      offsetSecs: 86400,
+      nowSecs: nowSecs, horizonSecs: horizonSecs, into: result,
+    );
+    await _collectServiceDay(
+      db: db, stopId: stopId,
+      serviceDay: today,
+      offsetSecs: 0,
+      nowSecs: nowSecs, horizonSecs: horizonSecs, into: result,
+    );
+
+    // TranslinkService takes the first N of this list as "the next N", so the
+    // merge across two service days has to be re-sorted, not just concatenated.
+    result.sort((a, b) =>
+        (a['minutes_away'] as int).compareTo(b['minutes_away'] as int));
+    return result.length > 30 ? result.sublist(0, 30) : result;
   }
 
   static Future<Map<String, String>> getRouteShortNames(List<String> routeIds) async {
