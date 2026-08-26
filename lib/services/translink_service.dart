@@ -28,7 +28,16 @@ enum ArrivalMode { live, scheduled }
 class ArrivalResult {
   final List<Arrival> arrivals;
   final ArrivalMode mode;
-  const ArrivalResult(this.arrivals, this.mode);
+
+  /// Set only when [arrivals] is empty: the next scheduled departure beyond the
+  /// lookup horizon. Lets the empty state say "next bus 07:30" rather than "no
+  /// upcoming buses", which matters because those are two different facts — one
+  /// says the buses have stopped for the night, the other could equally mean
+  /// the schedule data has expired. A stop that can name its next departure has
+  /// proved its data is present and valid.
+  final Arrival? nextDeparture;
+
+  const ArrivalResult(this.arrivals, this.mode, {this.nextDeparture});
 }
 
 class TranslinkService {
@@ -116,7 +125,14 @@ class TranslinkService {
           }
 
           merged.sort((a, b) => a.minutesAway.compareTo(b.minutesAway));
-          final result = ArrivalResult(merged.take(_maxArrivals).toList(), ArrivalMode.live);
+          final live = merged.take(_maxArrivals).toList();
+          final result = ArrivalResult(
+            live,
+            ArrivalMode.live,
+            // Live mode can be empty too — an idle feed plus a stop with nothing
+            // scheduled inside the horizon. Same question, same answer.
+            nextDeparture: live.isEmpty ? await _nextDepartureFor(stopCode) : null,
+          );
           _cache[stopCode] = (result, DateTime.now());
           return result;
         }
@@ -136,9 +152,30 @@ class TranslinkService {
       source:       'scheduled',
       delaySeconds: 0,
     )).toList();
-    final result = ArrivalResult(arrivals, ArrivalMode.scheduled);
+    final result = ArrivalResult(
+      arrivals,
+      ArrivalMode.scheduled,
+      nextDeparture: arrivals.isEmpty ? await _nextDepartureFor(stopCode) : null,
+    );
     _cache[stopCode] = (result, DateTime.now());
     return result;
+  }
+
+  /// The first departure beyond the schedule horizon, as an [Arrival].
+  ///
+  /// Only called when a lookup came back empty: it is an extra query, and it
+  /// earns its keep exactly when there is otherwise nothing to put on screen.
+  static Future<Arrival?> _nextDepartureFor(String stopCode) async {
+    final n = await DbService.getNextDeparture(stopCode);
+    if (n == null) return null;
+    return Arrival(
+      route:        n['route'] as String? ?? '',
+      destination:  n['headsign'] as String? ?? '',
+      minutesAway:  n['minutes_away'] as int? ?? 0,
+      arrivalTime:  n['arrival_time'] as String? ?? '',
+      source:       'scheduled',
+      delaySeconds: 0,
+    );
   }
 
   static Future<Uint8List?> _getFeed({bool forceRefresh = false}) async {

@@ -20,6 +20,7 @@ class _ArrivalsScreenState extends State<ArrivalsScreen> {
   bool _loading = true;
   String? _error;
   List<Arrival> _arrivals = [];
+  Arrival? _nextDeparture;
   bool _isFavourite = false;
   ArrivalMode _mode = ArrivalMode.live;
 
@@ -64,6 +65,7 @@ class _ArrivalsScreenState extends State<ArrivalsScreen> {
       if (mounted) setState(() {
         _loading = false;
         _arrivals = filtered;
+        _nextDeparture = result.nextDeparture;
         _mode = result.mode;
       });
     } catch (e) {
@@ -138,16 +140,59 @@ class _ArrivalsScreenState extends State<ArrivalsScreen> {
                   ),
                 )
               : _arrivals.isEmpty
-                  ? const Center(
-                      child: Text(
-                        'No upcoming buses',
-                        style: TextStyle(color: Colors.white54),
-                      ),
-                    )
+                  ? Center(child: _buildEmptyState())
                   : ListView.builder(
                       itemCount: _arrivals.length,
                       itemBuilder: (context, i) => _buildRow(_arrivals[i]),
                     ),
+    );
+  }
+
+  /// Empty is not one state. "Nothing due, and the first bus back is at 07:30"
+  /// is a useful answer; "nothing due" on its own is indistinguishable from a
+  /// stale schedule, which is the failure this app most needs to not have.
+  Widget _buildEmptyState() {
+    final next = _nextDeparture;
+    if (next == null) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(horizontal: 32),
+        child: Text(
+          'No upcoming buses',
+          textAlign: TextAlign.center,
+          style: TextStyle(color: Colors.white54),
+        ),
+      );
+    }
+
+    final hours = next.minutesAway ~/ 60;
+    final mins = next.minutesAway % 60;
+    final away = hours > 0 ? '${hours}h ${mins}m' : '${mins}m';
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 32),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Text(
+            'No buses due',
+            style: TextStyle(color: Colors.white54),
+          ),
+          const SizedBox(height: 12),
+          Text(
+            'Next bus ${next.arrivalTime}',
+            style: const TextStyle(
+              color: Color(0xFF60A5FA),
+              fontSize: 20,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            next.route.isEmpty ? 'in $away' : '${next.route} · in $away',
+            style: const TextStyle(color: Colors.white38, fontSize: 13),
+          ),
+        ],
+      ),
     );
   }
 

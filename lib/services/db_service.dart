@@ -294,9 +294,16 @@ class DbService {
     required int horizonSecs,
     required List<Map<String, dynamic>> into,
   }) async {
-    final fromSecs = nowSecs + offsetSecs;
-    if (fromSecs > _maxServiceDaySecs) return;
+    // Clamped at zero so a *future* service day (negative offset) is read from
+    // its own midnight — all of it is ahead of us — rather than from a negative
+    // time that has no GTFS representation.
+    final rawFrom = nowSecs + offsetSecs;
+    final fromSecs = rawFrom < 0 ? 0 : rawFrom;
     final toSecs = horizonSecs + offsetSecs;
+    // Nothing to ask for: the window has run past any plausible GTFS time
+    // (yesterday's service day, late in the day) or has not reached this
+    // service day at all yet (tomorrow's, for most of the day).
+    if (fromSecs > _maxServiceDaySecs || toSecs < 0) return;
 
     final dateStr = _yyyymmdd(serviceDay);
     final dowCol = _dayNames[serviceDay.weekday - 1];
@@ -361,49 +368,104 @@ class DbService {
     }
   }
 
-  /// Upcoming scheduled departures at [stopCode], newest-first by time.
-  ///
-  /// Two service days can contribute at any instant: today's, and yesterday's
-  /// via its post-midnight "24:xx" trips. Both are queried and merged.
+  /// Every departure at [stopId] between now and [horizonSecs], merged across
+  /// all three service days that can contribute one: yesterday's (its
+  /// post-midnight trips, stored as 24:xx), today's, and tomorrow's — which is
+  /// reachable whenever the window crosses midnight, e.g. a 23:50 lookup with a
+  /// six-hour horizon needs tomorrow's 05:14. Sorted by time.
+  static Future<List<Map<String, dynamic>>> _departuresWithin({
+    required Database db,
+    required String stopId,
+    required DateTime now,
+    required int nowSecs,
+    required int horizonSecs,
+  }) async {
+    final result = <Map<String, dynamic>>[];
+
+    for (final dayDelta in [-1, 0, 1]) {
+      await _collectServiceDay(
+        db: db,
+        stopId: stopId,
+        // Built from components rather than today.add(Duration(days: n)):
+        // adding a Duration across a daylight-saving boundary lands on 23:00 or
+        // 01:00 of the neighbouring day, which would read the wrong weekday
+        // column out of `calendar`. Dart normalises out-of-range day values.
+        serviceDay: DateTime(now.year, now.month, now.day + dayDelta),
+        // Exactly one nominal day per step, and deliberately not a measured
+        // difference — that returns 23 or 25 hours across a DST change. GTFS
+        // service days are 24 hours wide in the strings the feed ships; the
+        // publisher absorbs the clock change, not us.
+        offsetSecs: -dayDelta * 86400,
+        nowSecs: nowSecs,
+        horizonSecs: horizonSecs,
+        into: result,
+      );
+    }
+
+    // TranslinkService takes the first N of this list as "the next N", so a
+    // merge across service days has to be re-sorted, not just concatenated.
+    result.sort((a, b) =>
+        (a['minutes_away'] as int).compareTo(b['minutes_away'] as int));
+    return result;
+  }
+
+  static Future<String?> _stopIdFor(Database db, String stopCode) async {
+    final rows = await db.query('stops',
+        where: 'stop_code = ?', whereArgs: [stopCode], limit: 1);
+    return rows.isEmpty ? null : rows.first['stop_id'] as String;
+  }
+
+  /// Upcoming scheduled departures at [stopCode] within [scheduleHorizon],
+  /// soonest first.
   ///
   /// Deliberately has no "calendar matched nothing, so return everything"
   /// fallback. That path used to drop the service filter entirely and hand back
   /// trips from any day of the week — Sunday buses on a Tuesday, indistinguish-
-  /// able from real ones. An empty list is the honest answer when the schedule
-  /// has expired or the stop genuinely has no service left today.
+  /// able from real ones. Empty is the honest answer; [getNextDeparture] is
+  /// what turns that emptiness into something a user can read.
   static Future<List<Map<String, dynamic>>> getScheduledArrivals(String stopCode) async {
     final db = await database;
-
-    final stopRows = await db.query('stops',
-        where: 'stop_code = ?', whereArgs: [stopCode], limit: 1);
-    if (stopRows.isEmpty) return [];
-    final stopId = stopRows.first['stop_id'] as String;
+    final stopId = await _stopIdFor(db, stopCode);
+    if (stopId == null) return [];
 
     final now = DateTime.now();
     final nowSecs = now.hour * 3600 + now.minute * 60 + now.second;
-    final horizonSecs = nowSecs + scheduleHorizon.inSeconds;
-    final today = DateTime(now.year, now.month, now.day);
-
-    final result = <Map<String, dynamic>>[];
-
-    await _collectServiceDay(
-      db: db, stopId: stopId,
-      serviceDay: today.subtract(const Duration(days: 1)),
-      offsetSecs: 86400,
-      nowSecs: nowSecs, horizonSecs: horizonSecs, into: result,
+    final result = await _departuresWithin(
+      db: db,
+      stopId: stopId,
+      now: now,
+      nowSecs: nowSecs,
+      horizonSecs: nowSecs + scheduleHorizon.inSeconds,
     );
-    await _collectServiceDay(
-      db: db, stopId: stopId,
-      serviceDay: today,
-      offsetSecs: 0,
-      nowSecs: nowSecs, horizonSecs: horizonSecs, into: result,
-    );
-
-    // TranslinkService takes the first N of this list as "the next N", so the
-    // merge across two service days has to be re-sorted, not just concatenated.
-    result.sort((a, b) =>
-        (a['minutes_away'] as int).compareTo(b['minutes_away'] as int));
     return result.length > 30 ? result.sublist(0, 30) : result;
+  }
+
+  /// The next departure at [stopCode] looking further ahead than
+  /// [scheduleHorizon], or null if there is none within [within].
+  ///
+  /// Only worth calling when [getScheduledArrivals] came back empty. It is what
+  /// lets the empty state say "next bus 05:14" instead of "no upcoming buses" —
+  /// and that distinction carries real information, because a stop that can
+  /// name its next departure has proved its schedule data is present and valid.
+  /// Silence cannot tell the user whether the buses stopped or the data did.
+  static Future<Map<String, dynamic>?> getNextDeparture(
+    String stopCode, {
+    Duration within = const Duration(hours: 24),
+  }) async {
+    final db = await database;
+    final stopId = await _stopIdFor(db, stopCode);
+    if (stopId == null) return null;
+
+    final now = DateTime.now();
+    final nowSecs = now.hour * 3600 + now.minute * 60 + now.second;
+    final result = await _departuresWithin(
+      db: db,
+      stopId: stopId,
+      now: now,
+      nowSecs: nowSecs,
+      horizonSecs: nowSecs + within.inSeconds,
+    );
+    return result.isEmpty ? null : result.first;
   }
 
   static Future<Map<String, String>> getRouteShortNames(List<String> routeIds) async {

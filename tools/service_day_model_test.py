@@ -28,10 +28,11 @@ def gtfs_time(secs):
     return "%02d:%02d:%02d" % (secs//3600, (secs%3600)//60, secs%60)
 
 def collect(db, stop_id, service_day, offset, now_secs, horizon_secs, into):
-    from_s = now_secs + offset
-    if from_s > MAX_SERVICE_DAY:
-        return False                      # skipped, no query issued
+    raw_from = now_secs + offset
+    from_s = max(0, raw_from)
     to_s = horizon_secs + offset
+    if from_s > MAX_SERVICE_DAY or to_s < 0:
+        return False                      # skipped, no query issued
     date_str = service_day.strftime("%Y%m%d")
     dow = DAYS[service_day.weekday()]
     rows = db.execute(f"""
@@ -66,19 +67,30 @@ def collect(db, stop_id, service_day, offset, now_secs, horizon_secs, into):
                      'arrival_time':disp,'minutes_away':mins})
     return True
 
-def scheduled_arrivals(db, stop_code, now):
+def _within(db, stop_code, now, horizon_secs):
     r = db.execute("SELECT stop_id FROM stops WHERE stop_code=? LIMIT 1",(stop_code,)).fetchone()
     if not r: return [], []
     stop_id = r[0]
     now_secs = now.hour*3600 + now.minute*60 + now.second
-    horizon = now_secs + HORIZON
     today = datetime.date(now.year, now.month, now.day)
     out, queried = [], []
-    for day, off in ((today - datetime.timedelta(days=1), 86400), (today, 0)):
-        if collect(db, stop_id, day, off, now_secs, horizon, out):
+    for delta in (-1, 0, 1):
+        day = today + datetime.timedelta(days=delta)
+        off = -delta * 86400
+        if collect(db, stop_id, day, off, now_secs, horizon_secs, out):
             queried.append(off)
     out.sort(key=lambda x: x['minutes_away'])
+    return out, queried
+
+def scheduled_arrivals(db, stop_code, now):
+    now_secs = now.hour*3600 + now.minute*60 + now.second
+    out, queried = _within(db, stop_code, now, now_secs + HORIZON)
     return out[:30], queried
+
+def next_departure(db, stop_code, now, within=24*3600):
+    now_secs = now.hour*3600 + now.minute*60 + now.second
+    out, _ = _within(db, stop_code, now, now_secs + within)
+    return out[0] if out else None
 
 def build():
     db = sqlite3.connect(":memory:")
@@ -209,6 +221,45 @@ trip('t1','R3','WEEKDAY','Last one','25:10:00')   # Mon -> 01:10 Tue
 res,_ = scheduled_arrivals(db,'61234',TUE(1,0))
 check("01:00 Tue sees Monday's 25:10 as 10m",
       [(r['arrival_time'],r['minutes_away']) for r in res], [('01:10',10)])
+
+print("14. TOMORROW's service day is reachable when the horizon crosses midnight")
+db,trip = build()
+trip('t1','R1','WEEKDAY','First bus','05:14:00')   # Wed service day
+res,_ = scheduled_arrivals(db,'61234',TUE(23,50))
+check("23:50 Tue sees Wednesday's 05:14 at 324m",
+      [(r['arrival_time'],r['minutes_away']) for r in res], [('05:14',324)])
+
+print("15. ...and is NOT queried during the day, when it cannot contribute")
+db,trip = build()
+trip('t1','R1','WEEKDAY','Afternoon','14:00:00')
+res,q = scheduled_arrivals(db,'61234',TUE(13,0))
+check("13:00 -> today only", q, [0])
+res,q = scheduled_arrivals(db,'61234',TUE(23,50))
+check("23:50 -> today and tomorrow", q, [0,-86400])
+
+print("16. getNextDeparture names the first bus back after a dead night")
+db,trip = build()
+# Infrequent suburban stop: last bus 00:40, nothing again until 07:30.
+trip('t1','R3','WEEKDAY','Last one','24:40:00')    # Mon -> 00:40 Tue
+trip('t2','R1','WEEKDAY','First bus','07:30:00')   # Tue morning, 6.5h out
+res,_ = scheduled_arrivals(db,'61234',TUE(1,0))
+check("01:00 -> nothing inside the 6h horizon", res, [])
+nxt = next_departure(db,'61234',TUE(1,0))
+check("...but next departure is 07:30, 390m out",
+      (nxt['arrival_time'], nxt['minutes_away']), ('07:30',390))
+
+print("17. getNextDeparture returns None when there is genuinely no data")
+db,trip = build()                                   # no trips at all
+res,_ = scheduled_arrivals(db,'61234',TUE(2,0))
+nxt = next_departure(db,'61234',TUE(2,0))
+check("empty schedule -> empty arrivals AND no next bus", (res, nxt), ([], None))
+
+print("18. Late-night: next departure crosses into tomorrow's service day")
+db,trip = build()
+trip('t1','R1','WEEKDAY','First bus','06:00:00')
+nxt = next_departure(db,'61234',TUE(23,55))
+check("23:55 Tue -> Wednesday 06:00, 365m out",
+      (nxt['arrival_time'], nxt['minutes_away']), ('06:00',365))
 
 print(f"\n{passed} passed, {failed} failed")
 raise SystemExit(1 if failed else 0)
