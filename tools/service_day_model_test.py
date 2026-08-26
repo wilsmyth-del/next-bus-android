@@ -27,10 +27,9 @@ MAX_SERVICE_DAY = 30*3600
 def gtfs_time(secs):
     return "%02d:%02d:%02d" % (secs//3600, (secs%3600)//60, secs%60)
 
-def collect(db, stop_id, service_day, offset, now_secs, horizon_secs, into):
-    raw_from = now_secs + offset
-    from_s = max(0, raw_from)
-    to_s = horizon_secs + offset
+def collect(db, stop_id, service_day, offset, win_from, win_to, now_secs, include_past, into):
+    from_s = max(0, win_from + offset)
+    to_s = win_to + offset
     if from_s > MAX_SERVICE_DAY or to_s < 0:
         return False                      # skipped, no query issued
     date_str = service_day.strftime("%Y%m%d")
@@ -62,12 +61,13 @@ def collect(db, stop_id, service_day, offset, now_secs, horizon_secs, into):
         disp = "%02d:%02d" % (h % 24, m)
         dep = h*3600 + m*60 + s
         mins = (dep - offset - now_secs)//60
-        if mins < 0: continue
+        if not include_past and mins < 0: continue
         into.append({'trip_id':trip_id,'route':route,'headsign':headsign,
-                     'arrival_time':disp,'minutes_away':mins})
+                     'arrival_time':disp,'minutes_away':mins,
+                     'departure_secs':dep - offset})
     return True
 
-def _within(db, stop_code, now, horizon_secs):
+def _within(db, stop_code, now, win_from, win_to, include_past=False):
     r = db.execute("SELECT stop_id FROM stops WHERE stop_code=? LIMIT 1",(stop_code,)).fetchone()
     if not r: return [], []
     stop_id = r[0]
@@ -77,19 +77,19 @@ def _within(db, stop_code, now, horizon_secs):
     for delta in (-1, 0, 1):
         day = today + datetime.timedelta(days=delta)
         off = -delta * 86400
-        if collect(db, stop_id, day, off, now_secs, horizon_secs, out):
+        if collect(db, stop_id, day, off, win_from, win_to, now_secs, include_past, out):
             queried.append(off)
-    out.sort(key=lambda x: x['minutes_away'])
+    out.sort(key=lambda x: x['departure_secs'])
     return out, queried
 
 def scheduled_arrivals(db, stop_code, now):
     now_secs = now.hour*3600 + now.minute*60 + now.second
-    out, queried = _within(db, stop_code, now, now_secs + HORIZON)
+    out, queried = _within(db, stop_code, now, now_secs, now_secs + HORIZON)
     return out[:30], queried
 
 def next_departure(db, stop_code, now, within=24*3600):
     now_secs = now.hour*3600 + now.minute*60 + now.second
-    out, _ = _within(db, stop_code, now, now_secs + within)
+    out, _ = _within(db, stop_code, now, now_secs, now_secs + within)
     return out[0] if out else None
 
 def build():
@@ -260,6 +260,79 @@ trip('t1','R1','WEEKDAY','First bus','06:00:00')
 nxt = next_departure(db,'61234',TUE(23,55))
 check("23:55 Tue -> Wednesday 06:00, 365m out",
       (nxt['arrival_time'], nxt['minutes_away']), ('06:00',365))
+
+def arrivals_around(db, stop_code, now, target_secs, before=1, after=2):
+    now_secs = now.hour*3600 + now.minute*60 + now.second
+    rows,_ = _within(db, stop_code, now,
+                     target_secs - 3*3600, target_secs + 6*3600, include_past=True)
+    if not rows: return []
+    times=[]
+    for r in rows:
+        t=r['departure_secs']
+        if not times or times[-1]!=t: times.append(t)
+    pivot = next((i for i,t in enumerate(times) if t > target_secs), None)
+    first_after = len(times) if pivot is None else pivot
+    lo=max(0, first_after-before); hi=min(len(times), first_after+after)
+    chosen=set(times[lo:hi])
+    return [r for r in rows if r['departure_secs'] in chosen]
+
+HHMM = lambda h,m: h*3600+m*60
+
+print("19. Time mode: 1 distinct time before the target, 2 after")
+db,trip = build()
+for i,t in enumerate(['13:30:00','13:45:00','14:10:00','14:25:00','14:50:00']):
+    trip(f't{i}','R1','WEEKDAY','Downtown',t)
+res = arrivals_around(db,'61234',TUE(12,0),HHMM(14,0))
+check("noon planning for 14:00",
+      [r['arrival_time'] for r in res], ['13:45','14:10','14:25'])
+
+print("20. A chosen time brings ALL its routes (times, not trips)")
+db,trip = build()
+trip('a','R1','WEEKDAY','Downtown','13:45:00')
+trip('b','R1','WEEKDAY','Downtown','14:00:00')
+trip('c','R2','WEEKDAY','Metrotown','14:00:00')   # same time, different route
+trip('d','R3','WEEKDAY','Night','14:20:00')
+res = arrivals_around(db,'61234',TUE(12,0),HHMM(13,50))
+check("14:00 contributes two rows, still 3 distinct times",
+      [(r['route'],r['arrival_time']) for r in res],
+      [('99','13:45'),('99','14:00'),('014','14:00'),('N19','14:20')])
+
+print("21. First service of the day: no 'before' exists, two rows not broken")
+db,trip = build()
+trip('a','R1','WEEKDAY','First','05:00:00')
+trip('b','R1','WEEKDAY','Second','05:30:00')
+trip('c','R1','WEEKDAY','Third','06:00:00')
+res = arrivals_around(db,'61234',TUE(4,0),HHMM(4,30))
+check("target before first bus -> 2 rows, no crash",
+      [r['arrival_time'] for r in res], ['05:00','05:30'])
+
+print("22. The 'before' row can already have departed, and says so")
+db,trip = build()
+trip('a','R1','WEEKDAY','Missed','13:52:00')
+trip('b','R1','WEEKDAY','Catchable','14:05:00')
+trip('c','R1','WEEKDAY','Later','14:30:00')
+res = arrivals_around(db,'61234',TUE(13,55),HHMM(14,0))
+check("at 13:55, the 13:52 row carries negative minutes_away",
+      [(r['arrival_time'], r['minutes_away'] < 0) for r in res],
+      [('13:52',True),('14:05',False),('14:30',False)])
+
+print("23. Planning past the last bus falls back, does not go blank")
+db,trip = build()
+trip('a','R1','WEEKDAY','Last','22:40:00')
+trip('b','R1','WEEKDAY','Second last','22:10:00')
+res = arrivals_around(db,'61234',TUE(12,0),HHMM(23,30))
+# One row, not two: "1 before" is still 1 when the target sits past the last bus.
+# Planning at noon for 23:30 correctly answers "the closest is 22:40".
+check("target after last bus -> the one before it, alone",
+      [r['arrival_time'] for r in res], ['22:40'])
+
+print("24. Time mode spans midnight via the next service day")
+db,trip = build()
+trip('a','R3','WEEKDAY','Night','23:50:00')
+trip('b','R3','WEEKDAY','Late night','24:20:00')   # Tue service day -> 00:20 Wed
+res = arrivals_around(db,'61234',TUE(20,0),HHMM(23,55))
+check("planning 23:55 sees the 24:20 as 00:20",
+      [r['arrival_time'] for r in res], ['23:50','00:20'])
 
 print(f"\n{passed} passed, {failed} failed")
 raise SystemExit(1 if failed else 0)

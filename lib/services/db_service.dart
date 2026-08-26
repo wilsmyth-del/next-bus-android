@@ -244,6 +244,12 @@ class DbService {
   /// still finding the first bus of the morning.
   static const Duration scheduleHorizon = Duration(hours: 6);
 
+  /// How far either side of a planned time slice A looks when centring a
+  /// lookup. Back far enough to find "the one just before" at an hourly stop;
+  /// forward far enough to still offer options when the next few are sparse.
+  static const Duration _planningLookback = Duration(hours: 3);
+  static const Duration _planningLookahead = Duration(hours: 6);
+
   /// No real feed schedules a trip beyond this point in its service day. Past
   /// it, yesterday's service day cannot contribute anything and is skipped.
   static const int _maxServiceDaySecs = 30 * 3600; // 30:00:00
@@ -290,16 +296,18 @@ class DbService {
     required String stopId,
     required DateTime serviceDay,
     required int offsetSecs,
+    required int windowFromSecs,
+    required int windowToSecs,
     required int nowSecs,
-    required int horizonSecs,
+    required bool includePast,
     required List<Map<String, dynamic>> into,
   }) async {
     // Clamped at zero so a *future* service day (negative offset) is read from
     // its own midnight — all of it is ahead of us — rather than from a negative
     // time that has no GTFS representation.
-    final rawFrom = nowSecs + offsetSecs;
+    final rawFrom = windowFromSecs + offsetSecs;
     final fromSecs = rawFrom < 0 ? 0 : rawFrom;
-    final toSecs = horizonSecs + offsetSecs;
+    final toSecs = windowToSecs + offsetSecs;
     // Nothing to ask for: the window has run past any plausible GTFS time
     // (yesterday's service day, late in the day) or has not reached this
     // service day at all yet (tomorrow's, for most of the day).
@@ -356,7 +364,7 @@ class DbService {
 
       final depSecs = h * 3600 + m * 60 + s;
       final minutesAway = (depSecs - offsetSecs - nowSecs) ~/ 60;
-      if (minutesAway < 0) continue;
+      if (!includePast && minutesAway < 0) continue;
 
       into.add({
         'trip_id':      r['trip_id'] ?? '',
@@ -364,11 +372,16 @@ class DbService {
         'headsign':     r['headsign'] ?? '',
         'arrival_time': displayTime,
         'minutes_away': minutesAway,
+        // Absolute position in *today's* frame. Two service days can both offer
+        // an "00:30", so the display string is not a safe key for grouping or
+        // sorting departures across them. This is.
+        'departure_secs': depSecs - offsetSecs,
       });
     }
   }
 
-  /// Every departure at [stopId] between now and [horizonSecs], merged across
+  /// Every departure at [stopId] inside [windowFromSecs]..[windowToSecs]
+  /// (seconds since midnight in *today's* frame), merged across
   /// all three service days that can contribute one: yesterday's (its
   /// post-midnight trips, stored as 24:xx), today's, and tomorrow's — which is
   /// reachable whenever the window crosses midnight, e.g. a 23:50 lookup with a
@@ -378,7 +391,9 @@ class DbService {
     required String stopId,
     required DateTime now,
     required int nowSecs,
-    required int horizonSecs,
+    required int windowFromSecs,
+    required int windowToSecs,
+    bool includePast = false,
   }) async {
     final result = <Map<String, dynamic>>[];
 
@@ -396,8 +411,10 @@ class DbService {
         // service days are 24 hours wide in the strings the feed ships; the
         // publisher absorbs the clock change, not us.
         offsetSecs: -dayDelta * 86400,
+        windowFromSecs: windowFromSecs,
+        windowToSecs: windowToSecs,
         nowSecs: nowSecs,
-        horizonSecs: horizonSecs,
+        includePast: includePast,
         into: result,
       );
     }
@@ -405,7 +422,7 @@ class DbService {
     // TranslinkService takes the first N of this list as "the next N", so a
     // merge across service days has to be re-sorted, not just concatenated.
     result.sort((a, b) =>
-        (a['minutes_away'] as int).compareTo(b['minutes_away'] as int));
+        (a['departure_secs'] as int).compareTo(b['departure_secs'] as int));
     return result;
   }
 
@@ -435,7 +452,8 @@ class DbService {
       stopId: stopId,
       now: now,
       nowSecs: nowSecs,
-      horizonSecs: nowSecs + scheduleHorizon.inSeconds,
+      windowFromSecs: nowSecs,
+      windowToSecs: nowSecs + scheduleHorizon.inSeconds,
     );
     return result.length > 30 ? result.sublist(0, 30) : result;
   }
@@ -463,9 +481,70 @@ class DbService {
       stopId: stopId,
       now: now,
       nowSecs: nowSecs,
-      horizonSecs: nowSecs + within.inSeconds,
+      windowFromSecs: nowSecs,
+      windowToSecs: nowSecs + within.inSeconds,
     );
     return result.isEmpty ? null : result.first;
+  }
+
+  /// Departures at [stopCode] centred on [targetSecs] — seconds since midnight
+  /// in today's frame — for slice A's Time mode.
+  ///
+  /// Returns every departure at the last [before] distinct departure times at or
+  /// before the target, and the next [after] distinct times following it.
+  ///
+  /// The unit is a **departure time, not a trip**. Several routes can leave one
+  /// stop at 14:00, and the question being asked is "when do I need to be at the
+  /// stop" — a question about times. So a chosen time brings all its routes with
+  /// it, and three chosen times can be more than three rows.
+  ///
+  /// Past departures are included and carry a negative `minutes_away`. That is
+  /// deliberate: planning at 13:55 for 14:00, the 13:52 bus is part of the
+  /// answer. The caller must render it as uncatchable — see [Arrival.isPast].
+  static Future<List<Map<String, dynamic>>> getArrivalsAround(
+    String stopCode,
+    int targetSecs, {
+    int before = 1,
+    int after = 2,
+  }) async {
+    final db = await database;
+    final stopId = await _stopIdFor(db, stopCode);
+    if (stopId == null) return [];
+
+    final now = DateTime.now();
+    final nowSecs = now.hour * 3600 + now.minute * 60 + now.second;
+
+    final rows = await _departuresWithin(
+      db: db,
+      stopId: stopId,
+      now: now,
+      nowSecs: nowSecs,
+      windowFromSecs: targetSecs - _planningLookback.inSeconds,
+      windowToSecs: targetSecs + _planningLookahead.inSeconds,
+      includePast: true,
+    );
+    if (rows.isEmpty) return [];
+
+    // rows is already sorted by departure_secs.
+    final times = <int>[];
+    for (final r in rows) {
+      final t = r['departure_secs'] as int;
+      if (times.isEmpty || times.last != t) times.add(t);
+    }
+
+    final pivot = times.indexWhere((t) => t > targetSecs);
+    // Every departure in the window is at or before the target — the target sits
+    // after the last bus of the night. Fall back to the latest times available
+    // rather than returning nothing.
+    final firstAfter = pivot < 0 ? times.length : pivot;
+
+    final lo = (firstAfter - before) < 0 ? 0 : firstAfter - before;
+    final hi = (firstAfter + after) > times.length ? times.length : firstAfter + after;
+    final chosen = times.sublist(lo, hi).toSet();
+
+    return rows
+        .where((r) => chosen.contains(r['departure_secs'] as int))
+        .toList();
   }
 
   static Future<Map<String, String>> getRouteShortNames(List<String> routeIds) async {

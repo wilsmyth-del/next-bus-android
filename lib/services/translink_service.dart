@@ -13,6 +13,15 @@ class Arrival {
   final String source; // 'live', 'approx', 'scheduled'
   final int delaySeconds;
 
+  /// True when this departure has already gone.
+  ///
+  /// Only reachable in Time mode. Planning at 13:55 for 14:00, the 13:52 bus is
+  /// part of the honest answer — but a bus you cannot catch must never look like
+  /// one you can, least of all to someone who is already rushing. The Now path
+  /// never produces these: [DbService.getScheduledArrivals] drops them and the
+  /// live feed clamps at zero.
+  bool get isPast => minutesAway < 0;
+
   const Arrival({
     required this.route,
     required this.destination,
@@ -176,6 +185,31 @@ class TranslinkService {
       source:       'scheduled',
       delaySeconds: 0,
     );
+  }
+
+  /// Scheduled departures around [targetSecs] for slice A's Time mode.
+  ///
+  /// Schedule-only, deliberately: the RT feed describes vehicles that exist now,
+  /// so it has nothing to say about a bus two hours out. Mixing a live row into
+  /// a planning result would make one row more trustworthy-looking than its
+  /// neighbours for no reason the user could act on. Time mode is also the mode
+  /// that works with the radio off, which is the point of the whole app.
+  static Future<ArrivalResult> getArrivalsAt(String stopCode, int targetSecs) async {
+    final rows = await DbService.getArrivalsAround(stopCode, targetSecs);
+    final arrivals = rows
+        .map((r) => Arrival(
+              route:        r['route'] as String? ?? '',
+              destination:  r['headsign'] as String? ?? '',
+              minutesAway:  r['minutes_away'] as int? ?? 0,
+              arrivalTime:  r['arrival_time'] as String? ?? '',
+              source:       'scheduled',
+              delaySeconds: 0,
+            ))
+        .toList();
+    // Not cached: the cache is keyed by stop alone, and a planning result also
+    // depends on the chosen time. Caching it here would serve 14:00's answer to
+    // a later 16:00 lookup.
+    return ArrivalResult(arrivals, ArrivalMode.scheduled);
   }
 
   static Future<Uint8List?> _getFeed({bool forceRefresh = false}) async {
