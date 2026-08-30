@@ -76,12 +76,26 @@ class DbService {
       exception_type INTEGER NOT NULL,
       PRIMARY KEY (service_id, date)
     ''',
+    // No primary key, deliberately. `PRIMARY KEY (trip_id, stop_sequence)` built
+    // a second index across all ~3.7M rows and nothing ever read either column —
+    // every query goes through idx_stop_times_stop. It existed only so that
+    // ConflictAlgorithm.replace could dedupe, which staging does not need
+    // because it starts empty on every import. Dropping it removes an index of
+    // that size and speeds the inserts up as well.
+    //
+    // Trade-off, stated rather than buried: a duplicate (trip_id, stop_sequence)
+    // in the feed used to be silently replaced and would now render as a
+    // duplicate departure. GTFS forbids it and TransLink's feed is generated, so
+    // this trades a silent correction for a visible symptom — which is the right
+    // way round, but it is a change.
+    //
+    // stop_sequence itself is kept: it costs an integer, it is the natural key
+    // if dedupe or direction is ever needed, and removing it is a separate call.
     'stop_times': '''
       trip_id        TEXT NOT NULL,
       stop_id        TEXT NOT NULL,
       departure_time TEXT NOT NULL,
-      stop_sequence  INTEGER NOT NULL,
-      PRIMARY KEY (trip_id, stop_sequence)
+      stop_sequence  INTEGER NOT NULL
     ''',
   };
 

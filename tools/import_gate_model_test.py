@@ -59,12 +59,13 @@ FEED_TABLE_DDL = {
       exception_type INTEGER NOT NULL,
       PRIMARY KEY (service_id, date)
     ''',
+    # No primary key: it indexed ~3.7M rows on columns nothing reads. See the
+    # matching comment in db_service.dart for the trade-off this accepts.
     'stop_times': '''
       trip_id        TEXT NOT NULL,
       stop_id        TEXT NOT NULL,
       departure_time TEXT NOT NULL,
-      stop_sequence  INTEGER NOT NULL,
-      PRIMARY KEY (trip_id, stop_sequence)
+      stop_sequence  INTEGER NOT NULL
     ''',
 }
 
@@ -488,7 +489,35 @@ def _(db):
     assert staging_tables(db) == []
 
 
-@case('20. every feed table has a definition, and vice versa')
+@case('20. stop_times carries exactly one index — the one queries use')
+def _(db):
+    begin_import(db)
+    load_staging(db, good_feed())
+    validate_import(db)
+    commit_import(db, '2026-08-28')
+    idx = sorted(r[0] for r in db.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' "
+        "AND tbl_name='stop_times'").fetchall())
+    # An implicit sqlite_autoindex_* here would mean the primary key came back,
+    # and with it a second index over every row in the feed.
+    assert idx == ['idx_stop_times_stop'], idx
+
+
+@case('21. duplicate rows are no longer silently collapsed')
+def _(db):
+    # Documents the accepted trade-off rather than approving of it: without the
+    # primary key a malformed feed's duplicate row survives to the live table
+    # instead of being replaced on insert.
+    begin_import(db)
+    feed = good_feed(n_trips=1)
+    feed['stop_times'].append(dict(feed['stop_times'][0]))
+    load_staging(db, feed)
+    validate_import(db)
+    commit_import(db, '2026-08-28')
+    assert live_snapshot(db)['stop_times'] == 2
+
+
+@case('22. every feed table has a definition, and vice versa')
 def _(db):
     assert sorted(FEED_TABLES) == sorted(FEED_TABLE_DDL), \
         'FEED_TABLES and FEED_TABLE_DDL disagree'
