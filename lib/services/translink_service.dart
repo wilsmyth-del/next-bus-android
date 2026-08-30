@@ -13,6 +13,15 @@ class Arrival {
   final String source; // 'live', 'approx', 'scheduled'
   final int delaySeconds;
 
+  /// True when this departure has already gone.
+  ///
+  /// Only reachable in Time mode. Planning at 13:55 for 14:00, the 13:52 bus is
+  /// part of the honest answer — but a bus you cannot catch must never look like
+  /// one you can, least of all to someone who is already rushing. The Now path
+  /// never produces these: [DbService.getScheduledArrivals] drops them and the
+  /// live feed clamps at zero.
+  bool get isPast => minutesAway < 0;
+
   const Arrival({
     required this.route,
     required this.destination,
@@ -28,7 +37,16 @@ enum ArrivalMode { live, scheduled }
 class ArrivalResult {
   final List<Arrival> arrivals;
   final ArrivalMode mode;
-  const ArrivalResult(this.arrivals, this.mode);
+
+  /// Set only when [arrivals] is empty: the next scheduled departure beyond the
+  /// lookup horizon. Lets the empty state say "next bus 07:30" rather than "no
+  /// upcoming buses", which matters because those are two different facts — one
+  /// says the buses have stopped for the night, the other could equally mean
+  /// the schedule data has expired. A stop that can name its next departure has
+  /// proved its data is present and valid.
+  final Arrival? nextDeparture;
+
+  const ArrivalResult(this.arrivals, this.mode, {this.nextDeparture});
 }
 
 class TranslinkService {
@@ -116,7 +134,14 @@ class TranslinkService {
           }
 
           merged.sort((a, b) => a.minutesAway.compareTo(b.minutesAway));
-          final result = ArrivalResult(merged.take(_maxArrivals).toList(), ArrivalMode.live);
+          final live = merged.take(_maxArrivals).toList();
+          final result = ArrivalResult(
+            live,
+            ArrivalMode.live,
+            // Live mode can be empty too — an idle feed plus a stop with nothing
+            // scheduled inside the horizon. Same question, same answer.
+            nextDeparture: live.isEmpty ? await _nextDepartureFor(stopCode) : null,
+          );
           _cache[stopCode] = (result, DateTime.now());
           return result;
         }
@@ -136,9 +161,55 @@ class TranslinkService {
       source:       'scheduled',
       delaySeconds: 0,
     )).toList();
-    final result = ArrivalResult(arrivals, ArrivalMode.scheduled);
+    final result = ArrivalResult(
+      arrivals,
+      ArrivalMode.scheduled,
+      nextDeparture: arrivals.isEmpty ? await _nextDepartureFor(stopCode) : null,
+    );
     _cache[stopCode] = (result, DateTime.now());
     return result;
+  }
+
+  /// The first departure beyond the schedule horizon, as an [Arrival].
+  ///
+  /// Only called when a lookup came back empty: it is an extra query, and it
+  /// earns its keep exactly when there is otherwise nothing to put on screen.
+  static Future<Arrival?> _nextDepartureFor(String stopCode) async {
+    final n = await DbService.getNextDeparture(stopCode);
+    if (n == null) return null;
+    return Arrival(
+      route:        n['route'] as String? ?? '',
+      destination:  n['headsign'] as String? ?? '',
+      minutesAway:  n['minutes_away'] as int? ?? 0,
+      arrivalTime:  n['arrival_time'] as String? ?? '',
+      source:       'scheduled',
+      delaySeconds: 0,
+    );
+  }
+
+  /// Scheduled departures around [targetSecs] for slice A's Time mode.
+  ///
+  /// Schedule-only, deliberately: the RT feed describes vehicles that exist now,
+  /// so it has nothing to say about a bus two hours out. Mixing a live row into
+  /// a planning result would make one row more trustworthy-looking than its
+  /// neighbours for no reason the user could act on. Time mode is also the mode
+  /// that works with the radio off, which is the point of the whole app.
+  static Future<ArrivalResult> getArrivalsAt(String stopCode, int targetSecs) async {
+    final rows = await DbService.getArrivalsAround(stopCode, targetSecs);
+    final arrivals = rows
+        .map((r) => Arrival(
+              route:        r['route'] as String? ?? '',
+              destination:  r['headsign'] as String? ?? '',
+              minutesAway:  r['minutes_away'] as int? ?? 0,
+              arrivalTime:  r['arrival_time'] as String? ?? '',
+              source:       'scheduled',
+              delaySeconds: 0,
+            ))
+        .toList();
+    // Not cached: the cache is keyed by stop alone, and a planning result also
+    // depends on the chosen time. Caching it here would serve 14:00's answer to
+    // a later 16:00 lookup.
+    return ArrivalResult(arrivals, ArrivalMode.scheduled);
   }
 
   static Future<Uint8List?> _getFeed({bool forceRefresh = false}) async {
