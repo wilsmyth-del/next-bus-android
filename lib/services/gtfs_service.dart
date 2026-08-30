@@ -63,7 +63,36 @@ class GtfsService {
     return latest;
   }
 
+  /// Guards against two imports running at once.
+  ///
+  /// Both entrances — the home banner and Settings — call straight through to
+  /// the import with nothing stopping them overlapping. Found on device
+  /// 2026-08-30: a Settings refresh was still running when the banner refresh
+  /// was tapped. The second beginImport drops the first one's staging tables out
+  /// from under it, and whichever reaches the swap first can commit a feed that
+  /// is missing whatever the other had already written. What makes that worse
+  /// than a crash is that the result is structurally clean and passes every
+  /// check — it is simply short of rows, and nothing says so.
+  static bool _importing = false;
+
+  static bool get importInProgress => _importing;
+
   static Future<void> downloadAndBuild({
+    required FeedInfo feed,
+    required void Function(String) onStatus,
+  }) async {
+    if (_importing) throw const ImportInProgressException();
+    _importing = true;
+    try {
+      await _downloadAndBuild(feed: feed, onStatus: onStatus);
+    } finally {
+      // Released even when the import threw, so one failure cannot lock the app
+      // out of ever updating again until it is restarted.
+      _importing = false;
+    }
+  }
+
+  static Future<void> _downloadAndBuild({
     required FeedInfo feed,
     required void Function(String) onStatus,
   }) async {
@@ -310,4 +339,12 @@ class GtfsService {
     result.add(buf.toString().replaceAll('\r', ''));
     return result;
   }
+}
+
+/// Thrown when a schedule update is requested while one is already running.
+class ImportInProgressException implements Exception {
+  const ImportInProgressException();
+
+  @override
+  String toString() => 'A schedule update is already running.';
 }
