@@ -4,6 +4,101 @@ import 'package:path/path.dart';
 class DbService {
   static Database? _db;
 
+  // ---------------------------------------------------------------------------
+  // GTFS import — stage and swap
+  //
+  // The feed used to be written straight over the live tables: six independent
+  // DELETE-then-insert transactions, plus one more per stop_times chunk. Between
+  // the first commit and the last, the database held new stops against old trips
+  // against half-written stop_times, and any interruption — process killed, app
+  // backgrounded, network dropped — left it that way with nothing to roll back
+  // to. Slice B requires that failure or cancellation preserves the last working
+  // schedule. That was not merely unmet; it was the default outcome.
+  //
+  // Now every row lands in a parallel set of `_import` tables, the result is
+  // checked before anything live is touched, and the swap is one transaction.
+  // Two consequences worth naming:
+  //   * the live tables stay queryable for the whole download, so a refresh no
+  //     longer has any reason to block navigation;
+  //   * the data can be validated before it is adopted, which is impossible once
+  //     you have already deleted the alternative.
+  // ---------------------------------------------------------------------------
+
+  static const String _importSuffix = '_import';
+
+  /// The tables the GTFS import replaces, in swap order. Deliberately excludes
+  /// `favourites` and `metadata`: those are the user's, they are not in the
+  /// feed, and they must never sit inside the blast radius of an import.
+  static const List<String> _feedTables = [
+    'stops',
+    'routes',
+    'trips',
+    'calendar',
+    'calendar_dates',
+    'stop_times',
+  ];
+
+  /// One definition per feed table, used for the live schema *and* for the
+  /// staging copies. Written once because a staging table whose shape has
+  /// drifted from the live table is worse than no staging at all — it would swap
+  /// in cleanly and be wrong.
+  static const Map<String, String> _feedTableDdl = {
+    'stops': '''
+      stop_code TEXT PRIMARY KEY,
+      stop_id   TEXT NOT NULL,
+      stop_name TEXT NOT NULL DEFAULT ""
+    ''',
+    'routes': '''
+      route_id         TEXT PRIMARY KEY,
+      route_short_name TEXT NOT NULL DEFAULT ''
+    ''',
+    'trips': '''
+      trip_id    TEXT PRIMARY KEY,
+      route_id   TEXT NOT NULL,
+      service_id TEXT NOT NULL,
+      headsign   TEXT DEFAULT ''
+    ''',
+    'calendar': '''
+      service_id TEXT PRIMARY KEY,
+      monday     INTEGER DEFAULT 0,
+      tuesday    INTEGER DEFAULT 0,
+      wednesday  INTEGER DEFAULT 0,
+      thursday   INTEGER DEFAULT 0,
+      friday     INTEGER DEFAULT 0,
+      saturday   INTEGER DEFAULT 0,
+      sunday     INTEGER DEFAULT 0,
+      start_date TEXT NOT NULL DEFAULT '',
+      end_date   TEXT NOT NULL DEFAULT ''
+    ''',
+    'calendar_dates': '''
+      service_id     TEXT NOT NULL,
+      date           TEXT NOT NULL,
+      exception_type INTEGER NOT NULL,
+      PRIMARY KEY (service_id, date)
+    ''',
+    'stop_times': '''
+      trip_id        TEXT NOT NULL,
+      stop_id        TEXT NOT NULL,
+      departure_time TEXT NOT NULL,
+      stop_sequence  INTEGER NOT NULL,
+      PRIMARY KEY (trip_id, stop_sequence)
+    ''',
+  };
+
+  static String _createFeedTable(String table, {String suffix = ''}) =>
+      // Null-asserted deliberately: a table in _feedTables with no DDL is a
+      // programming error, and failing loudly beats creating a table whose body
+      // is the literal string "null".
+      'CREATE TABLE IF NOT EXISTS $table$suffix (${_feedTableDdl[table]!})';
+
+  /// Only ever built on the live table, after the swap. Staging is left
+  /// unindexed on purpose: inserting a few million stop_times rows without
+  /// maintaining an index is markedly faster, and building it once at the end
+  /// also keeps it under its canonical name.
+  static const String _stopTimesIndexSql =
+      'CREATE INDEX IF NOT EXISTS idx_stop_times_stop '
+      'ON stop_times(stop_id, departure_time)';
+
   static Future<Database> get database async {
     _db ??= await _open();
     return _db!;
@@ -15,13 +110,6 @@ class DbService {
       path,
       version: 4,
       onCreate: (db, v) async {
-        await db.execute('''
-          CREATE TABLE stops (
-            stop_code TEXT PRIMARY KEY,
-            stop_id   TEXT NOT NULL,
-            stop_name TEXT NOT NULL DEFAULT ""
-          )
-        ''');
         await db.execute('''
           CREATE TABLE metadata (
             key   TEXT PRIMARY KEY,
@@ -35,54 +123,12 @@ class DbService {
             added_at  TEXT DEFAULT (datetime('now'))
           )
         ''');
-        await db.execute('''
-          CREATE TABLE routes (
-            route_id         TEXT PRIMARY KEY,
-            route_short_name TEXT NOT NULL DEFAULT ''
-          )
-        ''');
-        await db.execute('''
-          CREATE TABLE trips (
-            trip_id    TEXT PRIMARY KEY,
-            route_id   TEXT NOT NULL,
-            service_id TEXT NOT NULL,
-            headsign   TEXT DEFAULT ''
-          )
-        ''');
-        await db.execute('''
-          CREATE TABLE calendar (
-            service_id TEXT PRIMARY KEY,
-            monday     INTEGER DEFAULT 0,
-            tuesday    INTEGER DEFAULT 0,
-            wednesday  INTEGER DEFAULT 0,
-            thursday   INTEGER DEFAULT 0,
-            friday     INTEGER DEFAULT 0,
-            saturday   INTEGER DEFAULT 0,
-            sunday     INTEGER DEFAULT 0,
-            start_date TEXT NOT NULL DEFAULT '',
-            end_date   TEXT NOT NULL DEFAULT ''
-          )
-        ''');
-        await db.execute('''
-          CREATE TABLE calendar_dates (
-            service_id     TEXT NOT NULL,
-            date           TEXT NOT NULL,
-            exception_type INTEGER NOT NULL,
-            PRIMARY KEY (service_id, date)
-          )
-        ''');
-        await db.execute('''
-          CREATE TABLE stop_times (
-            trip_id        TEXT NOT NULL,
-            stop_id        TEXT NOT NULL,
-            departure_time TEXT NOT NULL,
-            stop_sequence  INTEGER NOT NULL,
-            PRIMARY KEY (trip_id, stop_sequence)
-          )
-        ''');
-        await db.execute(
-          'CREATE INDEX idx_stop_times_stop ON stop_times(stop_id, departure_time)',
-        );
+        // Built from the same definitions the import staging tables use, so a
+        // staging table cannot drift from the table it is going to become.
+        for (final t in _feedTables) {
+          await db.execute(_createFeedTable(t));
+        }
+        await db.execute(_stopTimesIndexSql);
       },
       onUpgrade: (db, oldV, newV) async {
         if (oldV < 2) {
@@ -156,17 +202,8 @@ class DbService {
     );
   }
 
-  static Future<void> insertStops(List<Map<String, String>> stops) async {
-    final db = await database;
-    await db.transaction((txn) async {
-      await txn.execute('DELETE FROM stops');
-      final batch = txn.batch();
-      for (final s in stops) {
-        batch.insert('stops', s, conflictAlgorithm: ConflictAlgorithm.replace);
-      }
-      await batch.commit(noResult: true);
-    });
-  }
+  static Future<void> insertStops(List<Map<String, String>> stops) =>
+      _insertStaging('stops', stops);
 
   static Future<List<Map<String, dynamic>>> searchStops(String query) async {
     final db = await database;
@@ -561,62 +598,160 @@ class DbService {
     };
   }
 
-  static Future<void> insertRoutes(List<Map<String, String>> routes) async {
+  /// All feed inserts go to staging. There is no DELETE here any more: the
+  /// staging tables are created empty by [beginImport], so an import never has a
+  /// destructive first step.
+  static Future<void> _insertStaging(
+    String table,
+    List<Map<String, Object?>> rows,
+  ) async {
+    if (rows.isEmpty) return;
     final db = await database;
     await db.transaction((txn) async {
-      await txn.execute('DELETE FROM routes');
       final batch = txn.batch();
-      for (final r in routes) {
-        batch.insert('routes', r, conflictAlgorithm: ConflictAlgorithm.replace);
+      for (final r in rows) {
+        batch.insert('$table$_importSuffix', r,
+            conflictAlgorithm: ConflictAlgorithm.replace);
       }
       await batch.commit(noResult: true);
     });
   }
 
-  static Future<void> insertTrips(List<Map<String, String>> trips) async {
-    final db = await database;
-    await db.transaction((txn) async {
-      await txn.execute('DELETE FROM trips');
-      final batch = txn.batch();
-      for (final t in trips) {
-        batch.insert('trips', t, conflictAlgorithm: ConflictAlgorithm.replace);
-      }
-      await batch.commit(noResult: true);
-    });
-  }
+  static Future<void> insertRoutes(List<Map<String, String>> routes) =>
+      _insertStaging('routes', routes);
+
+  static Future<void> insertTrips(List<Map<String, String>> trips) =>
+      _insertStaging('trips', trips);
 
   static Future<void> insertCalendar(
     List<Map<String, dynamic>> calendar,
     List<Map<String, dynamic>> calendarDates,
   ) async {
+    await _insertStaging('calendar', calendar);
+    await _insertStaging('calendar_dates', calendarDates);
+  }
+
+  static Future<void> insertStopTimesBatch(List<Map<String, dynamic>> rows) =>
+      _insertStaging('stop_times', rows);
+
+  /// Drops any staging left behind by an interrupted import and creates a fresh,
+  /// empty set. Touches nothing live, so it is safe to call at any time.
+  static Future<void> beginImport() async {
     final db = await database;
     await db.transaction((txn) async {
-      await txn.execute('DELETE FROM calendar');
-      await txn.execute('DELETE FROM calendar_dates');
-      final batch = txn.batch();
-      for (final r in calendar) {
-        batch.insert('calendar', r, conflictAlgorithm: ConflictAlgorithm.replace);
+      for (final t in _feedTables) {
+        await txn.execute('DROP TABLE IF EXISTS $t$_importSuffix');
+        await txn.execute(_createFeedTable(t, suffix: _importSuffix));
       }
-      for (final r in calendarDates) {
-        batch.insert('calendar_dates', r, conflictAlgorithm: ConflictAlgorithm.replace);
-      }
-      await batch.commit(noResult: true);
     });
   }
 
-  static Future<void> clearStopTimes() async {
-    final db = await database;
-    await db.execute('DELETE FROM stop_times');
-  }
-
-  static Future<void> insertStopTimesBatch(List<Map<String, dynamic>> rows) async {
+  /// Throws away a failed import. Cheap and total: staging is inert, so there is
+  /// nothing to unwind and nothing live to restore.
+  static Future<void> abortImport() async {
     final db = await database;
     await db.transaction((txn) async {
-      final batch = txn.batch();
-      for (final r in rows) {
-        batch.insert('stop_times', r, conflictAlgorithm: ConflictAlgorithm.replace);
+      for (final t in _feedTables) {
+        await txn.execute('DROP TABLE IF EXISTS $t$_importSuffix');
       }
-      await batch.commit(noResult: true);
+    });
+  }
+
+  /// The other half of finding 2.
+  ///
+  /// The old code answered an empty schedule query by re-running it with the
+  /// calendar filter removed, which served Sunday buses on a Tuesday. A0 deleted
+  /// that fallback, which removed the wrong answer but not the condition it was
+  /// hiding: if `trips.service_id` does not join to `calendar`/`calendar_dates`
+  /// — a feed that changes id format, a calendar.txt we failed to parse — then
+  /// every stop in the app goes quiet and nothing says why.
+  ///
+  /// Checked here, against staging, because this is the only moment at which
+  /// rejecting the data still leaves a working schedule to fall back to.
+  static Future<ImportReport> validateImport() async {
+    final db = await database;
+
+    Future<int> count(String table) async {
+      return Sqflite.firstIntValue(
+            await db.rawQuery('SELECT COUNT(*) FROM $table$_importSuffix'),
+          ) ??
+          0;
+    }
+
+    final orphanTrips = Sqflite.firstIntValue(await db.rawQuery('''
+          SELECT COUNT(*) FROM trips$_importSuffix
+          WHERE service_id NOT IN (SELECT service_id FROM calendar$_importSuffix)
+            AND service_id NOT IN
+                (SELECT service_id FROM calendar_dates$_importSuffix)
+        ''')) ??
+        0;
+
+    final report = ImportReport(
+      stops: await count('stops'),
+      routes: await count('routes'),
+      trips: await count('trips'),
+      stopTimes: await count('stop_times'),
+      calendar: await count('calendar'),
+      calendarDates: await count('calendar_dates'),
+      tripsWithoutService: orphanTrips,
+    );
+
+    void require(bool ok, String message) {
+      if (!ok) throw ImportValidationException(message, report);
+    }
+
+    require(report.stops > 0, 'The schedule contained no stops.');
+    require(report.routes > 0, 'The schedule contained no routes.');
+    require(report.trips > 0, 'The schedule contained no trips.');
+    require(report.stopTimes > 0, 'The schedule contained no departure times.');
+    require(report.calendar > 0 || report.calendarDates > 0,
+        'The schedule contained no service calendar.');
+
+    // Does stop_times actually reach trips? A trip_id format change between the
+    // two files would leave both tables full and every join empty.
+    final linked = await db.rawQuery('''
+      SELECT 1 FROM stop_times$_importSuffix st
+      JOIN trips$_importSuffix t ON st.trip_id = t.trip_id
+      LIMIT 1
+    ''');
+    require(linked.isNotEmpty,
+        'Departure times in the schedule do not match any trip.');
+
+    // Deliberately a majority rather than a totality. A real feed can carry a
+    // few orphan trips, and failing a good download over one stray row would be
+    // its own kind of outage. Nothing near this threshold occurs in a healthy
+    // feed — the failure this guards against reads as 0%, not as 94%.
+    require(
+        report.serviceJoinRate >= 0.5,
+        'Only ${(report.serviceJoinRate * 100).toStringAsFixed(1)}% of trips in '
+        'this schedule have a matching service calendar, so the download was '
+        'not applied. Your existing schedule is unchanged.');
+
+    return report;
+  }
+
+  /// The swap. One transaction: the old tables go, staging takes their names,
+  /// the index is rebuilt, and the feed date is recorded — so a reader sees
+  /// either the whole old schedule or the whole new one, and the stored date can
+  /// never describe data that is not there.
+  ///
+  /// sqflite serialises work on a single connection, so queries issued during
+  /// the swap wait rather than observing a half-swapped database. The index
+  /// build is the slow part and is inside the transaction on purpose: a schedule
+  /// that is live but unindexed would be correct and unusably slow.
+  static Future<void> commitImport(String gtfsDate) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      for (final t in _feedTables) {
+        await txn.execute('DROP TABLE IF EXISTS $t');
+        await txn.execute('ALTER TABLE $t$_importSuffix RENAME TO $t');
+      }
+      await txn.execute(_stopTimesIndexSql);
+      await txn.insert(
+        'metadata',
+        {'key': 'gtfs_date', 'value': gtfsDate},
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
     });
   }
 
@@ -630,12 +765,53 @@ class DbService {
     );
   }
 
-  static Future<void> setGtfsDate(String date) async {
-    final db = await database;
-    await db.insert(
-      'metadata',
-      {'key': 'gtfs_date', 'value': date},
-      conflictAlgorithm: ConflictAlgorithm.replace,
-    );
-  }
+  // setGtfsDate is deliberately gone. The feed date is now written inside
+  // commitImport's transaction, because a second way to set it is a second way
+  // for the recorded date to describe data that is not there.
+}
+
+/// What the pre-swap checks found. Reported on success as well as failure: a
+/// check that only ever speaks when it fails cannot be told apart from a check
+/// that never ran.
+class ImportReport {
+  final int stops;
+  final int routes;
+  final int trips;
+  final int stopTimes;
+  final int calendar;
+  final int calendarDates;
+
+  /// Trips whose `service_id` appears in neither `calendar` nor
+  /// `calendar_dates`. In a healthy feed this is zero or near it.
+  final int tripsWithoutService;
+
+  const ImportReport({
+    required this.stops,
+    required this.routes,
+    required this.trips,
+    required this.stopTimes,
+    required this.calendar,
+    required this.calendarDates,
+    required this.tripsWithoutService,
+  });
+
+  int get tripsWithService => trips - tripsWithoutService;
+
+  double get serviceJoinRate => trips == 0 ? 0 : tripsWithService / trips;
+
+  @override
+  String toString() =>
+      '$stops stops, $routes routes, $trips trips, $stopTimes times, '
+      'service match ${(serviceJoinRate * 100).toStringAsFixed(1)}%';
+}
+
+/// Thrown when a downloaded feed fails its pre-swap checks. The live schedule is
+/// untouched when this is raised, which is the whole point of raising it here.
+class ImportValidationException implements Exception {
+  final String message;
+  final ImportReport? report;
+  const ImportValidationException(this.message, [this.report]);
+
+  @override
+  String toString() => message;
 }

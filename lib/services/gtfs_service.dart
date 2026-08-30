@@ -211,60 +211,85 @@ class GtfsService {
       }
     }
 
-    // --- Save stops, routes, trips, calendar ---
-    onStatus('Saving ${stops.length} stops...');
-    await DbService.insertStops(stops);
+    // Everything below writes to staging only. The live schedule is not touched
+    // until commitImport, so a malformed file, a killed process, or a user
+    // walking out of Wi-Fi range leaves the last working schedule exactly as it
+    // was — which is what slice B requires and what the old write-in-place
+    // import could not offer.
+    await DbService.beginImport();
+    try {
+      onStatus('Saving ${stops.length} stops...');
+      await DbService.insertStops(stops);
 
-    onStatus('Saving routes and trips...');
-    await DbService.insertRoutes(routes);
-    await DbService.insertTrips(trips);
-    await DbService.insertCalendar(calendarRows, calDateRows);
+      onStatus('Saving routes and trips...');
+      await DbService.insertRoutes(routes);
+      await DbService.insertTrips(trips);
+      await DbService.insertCalendar(calendarRows, calDateRows);
 
-    // --- stop_times.txt (largest file — chunked) ---
-    onStatus('Parsing schedule times...');
-    final stEntry = archive.findFile('stop_times.txt');
-    if (stEntry != null) {
-      final stLines = const LineSplitter().convert(utf8.decode(stEntry.content));
-      if (stLines.isNotEmpty) {
-        final h      = stLines[0].split(',').map((e) => e.trim()).toList();
-        final tIdx   = h.indexOf('trip_id');
-        final siIdx  = h.indexOf('stop_id');
-        final depIdx = h.indexOf('departure_time');
-        final seqIdx = h.indexOf('stop_sequence');
+      // --- stop_times.txt (largest file — chunked) ---
+      onStatus('Parsing schedule times...');
+      final stEntry = archive.findFile('stop_times.txt');
+      if (stEntry != null) {
+        final stLines =
+            const LineSplitter().convert(utf8.decode(stEntry.content));
+        if (stLines.isNotEmpty) {
+          final h = stLines[0].split(',').map((e) => e.trim()).toList();
+          final tIdx = h.indexOf('trip_id');
+          final siIdx = h.indexOf('stop_id');
+          final depIdx = h.indexOf('departure_time');
+          final seqIdx = h.indexOf('stop_sequence');
 
-        await DbService.clearStopTimes();
+          const chunkSize = 5000;
+          var chunk = <Map<String, dynamic>>[];
+          final total = stLines.length - 1;
+          var saved = 0;
 
-        const chunkSize = 5000;
-        var chunk = <Map<String, dynamic>>[];
-        final total = stLines.length - 1;
-        var saved = 0;
-
-        for (final line in stLines.skip(1)) {
-          if (line.trim().isEmpty) continue;
-          final cols = _parseCsv(line);
-          if (tIdx < 0 || cols.length <= tIdx) continue;
-          chunk.add({
-            'trip_id':        cols[tIdx].trim(),
-            'stop_id':        siIdx >= 0 && cols.length > siIdx ? cols[siIdx].trim() : '',
-            'departure_time': depIdx >= 0 && cols.length > depIdx ? cols[depIdx].trim() : '',
-            'stop_sequence':  seqIdx >= 0 && cols.length > seqIdx
-                ? (int.tryParse(cols[seqIdx].trim()) ?? 0)
-                : 0,
-          });
-          if (chunk.length >= chunkSize) {
+          for (final line in stLines.skip(1)) {
+            if (line.trim().isEmpty) continue;
+            final cols = _parseCsv(line);
+            if (tIdx < 0 || cols.length <= tIdx) continue;
+            chunk.add({
+              'trip_id': cols[tIdx].trim(),
+              'stop_id':
+                  siIdx >= 0 && cols.length > siIdx ? cols[siIdx].trim() : '',
+              'departure_time':
+                  depIdx >= 0 && cols.length > depIdx ? cols[depIdx].trim() : '',
+              'stop_sequence': seqIdx >= 0 && cols.length > seqIdx
+                  ? (int.tryParse(cols[seqIdx].trim()) ?? 0)
+                  : 0,
+            });
+            if (chunk.length >= chunkSize) {
+              await DbService.insertStopTimesBatch(chunk);
+              saved += chunk.length;
+              onStatus('Saving schedule... $saved / $total');
+              chunk = [];
+            }
+          }
+          if (chunk.isNotEmpty) {
             await DbService.insertStopTimesBatch(chunk);
-            saved += chunk.length;
-            onStatus('Saving schedule... $saved / $total');
-            chunk = [];
           }
         }
-        if (chunk.isNotEmpty) {
-          await DbService.insertStopTimesBatch(chunk);
-        }
       }
-    }
 
-    await DbService.setGtfsDate(feed.date);
+      // Checked before the swap, while there is still something to fall back to.
+      onStatus('Checking schedule data...');
+      final report = await DbService.validateImport();
+
+      onStatus('Applying update...');
+      await DbService.commitImport(feed.date);
+
+      // Reported on the way out rather than only on failure, so a healthy import
+      // says what it actually loaded.
+      onStatus('Schedule updated — $report');
+    } catch (_) {
+      try {
+        await DbService.abortImport();
+      } catch (_) {
+        // Staging is inert: leaving it behind costs disk, not correctness, and
+        // the next import drops it. Never let cleanup replace the real error.
+      }
+      rethrow;
+    }
   }
 
   static List<String> _parseCsv(String line) {
