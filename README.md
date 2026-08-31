@@ -2,6 +2,8 @@
 
 A minimal Android app for TransLink (Metro Vancouver) riders: search a stop number, scan a stop sign with your camera, save favourites, and see live or scheduled arrivals.
 
+**[Download the latest APK](../../releases/latest)**
+
 This is a personal project, not affiliated with or endorsed by TransLink.
 
 ## Features
