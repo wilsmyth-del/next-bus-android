@@ -273,12 +273,22 @@ class DbService {
     return (count ?? 0) > 0;
   }
 
-  static Future<String?> getGtfsDate() async {
+  static Future<String?> getGtfsDate() => _metadata('gtfs_date');
+
+  /// When the last import actually succeeded, ISO-8601 local (#321 slice B2).
+  ///
+  /// Distinct from `gtfs_date`, which is the *feed's* date. The two answer
+  /// different questions — "how old is the schedule I am using" versus "when did
+  /// this phone last manage to update" — and a user staring at a stale feed date
+  /// cannot tell a feed that has not moved from downloads that have been failing.
+  static Future<String?> getGtfsUpdatedAt() => _metadata('gtfs_updated_at');
+
+  static Future<String?> _metadata(String key) async {
     final db = await database;
     final rows = await db.query(
       'metadata',
       where: 'key = ?',
-      whereArgs: ['gtfs_date'],
+      whereArgs: [key],
     );
     if (rows.isEmpty) return null;
     return rows.first['value'] as String?;
@@ -852,6 +862,14 @@ class DbService {
       await txn.insert(
         'metadata',
         {'key': 'gtfs_date', 'value': gtfsDate},
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+      // In the same transaction as the swap and the feed date, for the same
+      // reason: a recorded success that is not tied to the data landing is a
+      // recorded success that can lie.
+      await txn.insert(
+        'metadata',
+        {'key': 'gtfs_updated_at', 'value': DateTime.now().toIso8601String()},
         conflictAlgorithm: ConflictAlgorithm.replace,
       );
     });

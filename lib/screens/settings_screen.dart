@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../services/api_key_service.dart';
+import '../services/connectivity_gate.dart';
 import '../services/translink_service.dart';
 import '../services/db_service.dart';
 import '../services/gtfs_service.dart';
@@ -12,6 +13,12 @@ class SettingsScreen extends StatefulWidget {
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
+  // Hoisted out of the widget tree rather than repeated as literals, which is
+  // what the rest of the app already does (home_screen.dart:20-22). Ten copies
+  // of a hex value is ten places to miss when one changes.
+  static const Color _surface = Color(0xFF1A1D27);
+  static const Color _accent = Color(0xFF60A5FA);
+
   final _controller = TextEditingController();
   bool _loading = true;
   bool _saved = false;
@@ -19,6 +26,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _liteMode = false;
   bool _refreshingGtfs = false;
   String? _gtfsDate;
+  String? _gtfsUpdatedAt;
 
   @override
   void initState() {
@@ -36,56 +44,119 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final key = await ApiKeyService.getKey();
     final liteMode = await ApiKeyService.getLiteMode();
     final gtfsDate = await DbService.getGtfsDate();
+    final gtfsUpdatedAt = await DbService.getGtfsUpdatedAt();
     if (mounted) {
       setState(() {
         _controller.text = key ?? '';
         _hasKey = key != null;
         _liteMode = liteMode;
         _gtfsDate = gtfsDate;
+        _gtfsUpdatedAt = gtfsUpdatedAt;
         _loading = false;
       });
     }
   }
 
+  /// The only path in the app that downloads a schedule (#321 slice B2).
+  ///
+  /// Order matters: find the feed, decide whether it is even news, and only then
+  /// ask about data. Asking "download 15 MB over mobile?" before knowing there is
+  /// anything to download would be a dialog that sometimes means nothing.
   Future<void> _refreshGtfs() async {
     setState(() => _refreshingGtfs = true);
     try {
-      final feed = await GtfsService.findLatestFeed();
-      if (feed == null) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('No GTFS feed found')),
-          );
-        }
+      final check = await GtfsService.checkForUpdate();
+
+      if (check.status == UpdateStatus.noFeed) {
+        _say('No schedule feed found — check your connection and try again');
         return;
       }
-      if (_gtfsDate == feed.date) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Already up to date (${feed.date})')),
-          );
-        }
+      if (check.status == UpdateStatus.current) {
+        _say('Already up to date (${check.feed!.date})');
         return;
       }
-      await GtfsService.downloadAndBuild(
-        feed: feed,
-        onStatus: (_) {},
-      );
+
+      final feed = check.feed!;
+      final kind = await ConnectivityGate.current();
+      if (ConnectivityGate.needsConfirmation(kind)) {
+        final proceed = await _confirmMeteredDownload(kind);
+        if (proceed != true) return;
+      }
+
+      await GtfsService.downloadAndBuild(feed: feed, onStatus: (_) {});
+      final updatedAt = await DbService.getGtfsUpdatedAt();
       if (mounted) {
-        setState(() => _gtfsDate = feed.date);
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Updated to ${feed.date}')),
-        );
+        setState(() {
+          _gtfsDate = feed.date;
+          _gtfsUpdatedAt = updatedAt;
+        });
+        _say('Updated to ${feed.date}');
       }
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Update failed: $e')),
-        );
-      }
+      _say('Update failed: $e');
     } finally {
       if (mounted) setState(() => _refreshingGtfs = false);
     }
+  }
+
+  /// Reads the update stamp in the tense a person would use.
+  ///
+  /// "Unknown" is the honest answer for a database that predates slice B2: the
+  /// stamp is only written by [DbService.commitImport], so a schedule imported
+  /// before this release genuinely has no recorded date and saying "never" would
+  /// be a lie about a download that did happen.
+  static String _formatUpdatedAt(String? iso) {
+    if (iso == null) return 'unknown (before this version)';
+    final when = DateTime.tryParse(iso);
+    if (when == null) return 'unknown';
+    final age = DateTime.now().difference(when);
+    if (age.inMinutes < 1) return 'just now';
+    if (age.inHours < 1) return '${age.inMinutes} min ago';
+    if (age.inHours < 24) return '${age.inHours}h ago';
+    if (age.inDays == 1) return 'yesterday';
+    if (age.inDays < 30) return '${age.inDays} days ago';
+    return '${when.year}-${when.month.toString().padLeft(2, '0')}-'
+        '${when.day.toString().padLeft(2, '0')}';
+  }
+
+  void _say(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  /// Names the cost before spending it. The size and the duration are both in
+  /// the body because either one alone understates it — 15 MB sounds cheap, and
+  /// "a few minutes" sounds like a spinner rather than an app that is unusable
+  /// while it runs.
+  Future<bool?> _confirmMeteredDownload(NetworkKind kind) {
+    final line = kind == NetworkKind.cellular
+        ? 'You are on mobile data.'
+        : 'This device is not on Wi-Fi.';
+    return showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: _surface,
+        title: const Text('Download schedule data?',
+            style: TextStyle(color: Colors.white)),
+        content: Text(
+          '$line\n\n'
+          'The transit schedule is about 15 MB and takes a few minutes. '
+          'Next Bus cannot look up stops while it downloads.',
+          style: const TextStyle(color: Colors.white70),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel', style: TextStyle(color: Colors.white54)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Download',
+                style: TextStyle(color: _accent)),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _save() async {
@@ -106,11 +177,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Settings', style: TextStyle(fontWeight: FontWeight.bold)),
-        backgroundColor: const Color(0xFF1A1D27),
+        backgroundColor: _surface,
         foregroundColor: Colors.white,
       ),
       body: _loading
-          ? const Center(child: CircularProgressIndicator(color: Color(0xFF60A5FA)))
+          ? const Center(child: CircularProgressIndicator(color: _accent))
           : ListView(
               padding: const EdgeInsets.all(16),
               children: [
@@ -121,7 +192,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 const SizedBox(height: 8),
                 Container(
                   decoration: BoxDecoration(
-                    color: const Color(0xFF1A1D27),
+                    color: _surface,
                     borderRadius: BorderRadius.circular(12),
                   ),
                   child: SwitchListTile(
@@ -131,7 +202,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       style: TextStyle(color: Colors.white54, fontSize: 12),
                     ),
                     value: _liteMode,
-                    activeColor: const Color(0xFF60A5FA),
+                    activeColor: _accent,
                     onChanged: (val) async {
                       await ApiKeyService.setLiteMode(val);
                       TranslinkService.clearCache();
@@ -184,7 +255,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     hintText: 'Paste your TransLink API key',
                     hintStyle: const TextStyle(color: Colors.white38),
                     filled: true,
-                    fillColor: const Color(0xFF1A1D27),
+                    fillColor: _surface,
                     border: OutlineInputBorder(
                       borderRadius: BorderRadius.circular(12),
                       borderSide: BorderSide.none,
@@ -195,7 +266,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ElevatedButton(
                   onPressed: _save,
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF60A5FA),
+                    backgroundColor: _accent,
                     foregroundColor: Colors.black,
                     padding: const EdgeInsets.symmetric(vertical: 14),
                     minimumSize: const Size(double.infinity, 0),
@@ -214,6 +285,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       : 'No schedule data downloaded yet',
                   style: const TextStyle(color: Colors.white54, fontSize: 13),
                 ),
+                if (_gtfsDate != null) ...[
+                  const SizedBox(height: 4),
+                  Text(
+                    'Last updated: ${_formatUpdatedAt(_gtfsUpdatedAt)}',
+                    style: const TextStyle(color: Colors.white38, fontSize: 12),
+                  ),
+                ],
                 const SizedBox(height: 12),
                 OutlinedButton(
                   onPressed: (_refreshingGtfs || _liteMode) ? null : _refreshGtfs,
@@ -227,7 +305,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       ? const SizedBox(
                           width: 18,
                           height: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF60A5FA)),
+                          child: CircularProgressIndicator(strokeWidth: 2, color: _accent),
                         )
                       : const Text('Refresh Transit Data'),
                 ),
@@ -252,7 +330,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 Container(
                   padding: const EdgeInsets.all(12),
                   decoration: BoxDecoration(
-                    color: const Color(0xFF1A1D27),
+                    color: _surface,
                     borderRadius: BorderRadius.circular(12),
                   ),
                   child: const Text(
@@ -282,7 +360,7 @@ class _Step extends StatelessWidget {
         children: [
           CircleAvatar(
             radius: 11,
-            backgroundColor: const Color(0xFF60A5FA),
+            backgroundColor: _accent,
             child: Text(number, style: const TextStyle(color: Colors.black, fontSize: 12, fontWeight: FontWeight.bold)),
           ),
           const SizedBox(width: 12),

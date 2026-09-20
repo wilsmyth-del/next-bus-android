@@ -109,12 +109,13 @@ class _HomeScreenState extends State<HomeScreen> {
     // Passive update check (not in lite mode).
     if (!_liteMode) {
       try {
-        final update = await GtfsService.checkForUpdate();
-        if (update != null && mounted) {
-          setState(() => _pendingUpdate = update);
+        final check = await GtfsService.checkForUpdate();
+        if (check.status == UpdateStatus.available && mounted) {
+          setState(() => _pendingUpdate = check.feed);
         }
       } catch (_) {
-        // Ignore background check failures silently.
+        // Ignore background check failures silently. The check is a courtesy;
+        // it never downloads anything, so a failure costs the user nothing.
       }
     }
 
@@ -130,55 +131,6 @@ class _HomeScreenState extends State<HomeScreen> {
     final favs = await DbService.getFavourites();
     if (mounted) {
       setState(() => _favourites = List<Map<String, dynamic>>.from(favs));
-    }
-  }
-
-  // ── GTFS refresh (AppBar action) ──────────────────────────────────────────
-
-  Future<void> _manualRefresh() async {
-    setState(() {
-      _loading = true;
-      _loadingStatus = 'Checking for GTFS update…';
-    });
-
-    try {
-      final feed = await GtfsService.findLatestFeed();
-      if (feed == null) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('No GTFS feed found.')),
-          );
-        }
-        setState(() => _loading = false);
-        return;
-      }
-
-      setState(() => _loadingStatus = 'Downloading stop data…');
-      await GtfsService.downloadAndBuild(
-        feed: feed,
-        onStatus: (msg) {
-          if (mounted) setState(() => _loadingStatus = msg);
-        },
-      );
-
-      await _loadFavourites();
-
-      if (mounted) {
-        setState(() {
-          _pendingUpdate = null;
-          _loading = false;
-        });
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Stop data updated.')),
-        );
-      }
-    } catch (e) {
-      if (mounted) {
-        setState(() => _loading = false);
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Update failed: $e')),
-        );
-      }
     }
   }
 
@@ -320,6 +272,27 @@ class _HomeScreenState extends State<HomeScreen> {
     await _loadFavourites();
   }
 
+  /// Shared by the AppBar icon and the update banner. Re-checks on return so a
+  /// banner does not sit there claiming an update is available after Settings
+  /// has just installed it.
+  Future<void> _openSettings() async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const SettingsScreen()),
+    );
+    if (!mounted) return;
+    try {
+      final check = await GtfsService.checkForUpdate();
+      if (mounted) {
+        setState(() => _pendingUpdate =
+            check.status == UpdateStatus.available ? check.feed : null);
+      }
+    } catch (_) {
+      // A failed re-check should not leave a stale banner asserting an update.
+      if (mounted) setState(() => _pendingUpdate = null);
+    }
+  }
+
   void _clearSearch() {
     _searchController.clear();
     setState(() => _searchResults = []);
@@ -350,19 +323,9 @@ class _HomeScreenState extends State<HomeScreen> {
             },
           ),
           IconButton(
-            icon: const Icon(Icons.refresh),
-            tooltip: 'Check for GTFS update',
-            onPressed: _liteMode ? null : _manualRefresh,
-          ),
-          IconButton(
             icon: const Icon(Icons.settings_outlined),
             tooltip: 'Settings',
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(builder: (_) => const SettingsScreen()),
-              );
-            },
+            onPressed: _openSettings,
           ),
         ],
       ),
@@ -443,11 +406,19 @@ class _HomeScreenState extends State<HomeScreen> {
 
   // ── GTFS update banner ────────────────────────────────────────────────────
 
+  /// Tells, and points. It does not download (#321 slice B2).
+  ///
+  /// This banner used to call the same `_manualRefresh` as the AppBar icon, so
+  /// the worst possible moment to start a multi-minute blocking download — the
+  /// moment someone opened the app to catch a bus — was two taps away on the
+  /// first screen. Settings is now the only path, and it is the path that asks
+  /// about mobile data first.
   Widget _buildUpdateBanner() {
     return MaterialBanner(
       backgroundColor: _surface,
       content: Text(
-        'GTFS update available (${_pendingUpdate!.date}).',
+        'Newer schedule data is available (${_pendingUpdate!.date}). '
+        'Update it in Settings — it takes a few minutes.',
         style: const TextStyle(color: Colors.white70),
       ),
       actions: [
@@ -456,8 +427,8 @@ class _HomeScreenState extends State<HomeScreen> {
           child: const Text('Dismiss', style: TextStyle(color: Colors.white54)),
         ),
         TextButton(
-          onPressed: _liteMode ? null : _manualRefresh,
-          child: const Text('Refresh', style: TextStyle(color: _accent)),
+          onPressed: _openSettings,
+          child: const Text('Settings', style: TextStyle(color: _accent)),
         ),
       ],
     );
