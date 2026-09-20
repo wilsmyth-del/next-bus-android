@@ -45,4 +45,11 @@ app.*.map.json
 /android/app/release
 
 # FVM Version Cache
+# .fvm/flutter_sdk is the legacy layout. Newer FVM downloads whole SDKs into
+# .fvm/versions/ and writes .fvm/version and .fvm/release beside them — none of
+# which were ignored, so on the laptop they sat in `git status` as untracked and
+# one `git add -A` away from committing an entire Flutter SDK.
 .fvm/flutter_sdk
+.fvm/versions/
+.fvm/version
+.fvm/release
