@@ -222,6 +222,48 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  /// Persist a drag. Optimistic like [_deleteFavourite]: the list moves first
+  /// and rolls back whole if the write does not take.
+  Future<void> _reorderFavourites(int oldIndex, int newIndex) async {
+    // ReorderableListView reports newIndex as the slot the row would occupy
+    // *before* it is lifted out, so every downward move is reported one too
+    // far. This adjustment is the framework's documented contract, not a
+    // workaround.
+    if (newIndex > oldIndex) newIndex -= 1;
+    if (newIndex == oldIndex) return;
+
+    // _favourites is already a growable copy (see _loadFavourites) — the #308
+    // read-only-list bug is guarded there, and removeAt/insert rely on it.
+    final previous = List<Map<String, dynamic>>.from(_favourites);
+
+    setState(() {
+      final moved = _favourites.removeAt(oldIndex);
+      _favourites.insert(newIndex, moved);
+    });
+
+    try {
+      final order = _favourites.map((f) => f['stop_code'] as String).toList();
+      final updated = await DbService.reorderFavourites(order);
+      if (updated != order.length && mounted) {
+        setState(() => _favourites = previous);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+                'Reorder wrote $updated of ${order.length} stops — order restored'),
+          ),
+        );
+      }
+    } catch (e, st) {
+      debugPrint('_reorderFavourites failed: $e\n$st');
+      if (mounted) {
+        setState(() => _favourites = previous);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Reorder failed: $e')),
+        );
+      }
+    }
+  }
+
   Future<void> _renameFavourite(String stopCode, String currentName) async {
     final controller = TextEditingController(text: currentName);
     final newName = await showDialog<String>(
@@ -473,42 +515,52 @@ class _HomeScreenState extends State<HomeScreen> {
       );
     }
 
-    return ListView.builder(
+    // Long-press to drag, with no drag handles (Wil, 2026-09-20): the default
+    // Android handle sits on the right edge, which is exactly where
+    // flutter_slidable's swipe-to-remove begins. That swipe took four rounds
+    // to get right (#308) and is not being asked to share an edge.
+    return ReorderableListView.builder(
       itemCount: _favourites.length,
+      onReorder: _reorderFavourites,
+      buildDefaultDragHandles: false,
       itemBuilder: (context, index) {
         final fav = _favourites[index];
         final stopCode = fav['stop_code'] as String;
         final stopName = fav['stop_name'] as String;
 
-        return Slidable(
-          key: Key(stopCode),
-          endActionPane: ActionPane(
-            motion: const DrawerMotion(),
-            extentRatio: 0.5,
-            children: [
-              SlidableAction(
-                onPressed: (_) => _renameFavourite(stopCode, stopName),
-                backgroundColor: _accent,
-                foregroundColor: Colors.white,
-                icon: Icons.edit,
-                label: 'Rename',
-              ),
-              SlidableAction(
-                onPressed: (_) => _deleteFavourite(stopCode),
-                backgroundColor: Colors.red.shade700,
-                foregroundColor: Colors.white,
-                icon: Icons.delete,
-                label: 'Delete',
-              ),
-            ],
-          ),
-          child: ListTile(
-            tileColor: _surface,
-            leading: const Icon(Icons.star, color: _accent, size: 20),
-            title: Text(stopCode,
-                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-            subtitle: Text(stopName, style: const TextStyle(color: Colors.white54, fontSize: 12)),
-            onTap: () => _openArrivals(stopCode, stopName),
+        return ReorderableDelayedDragStartListener(
+          key: ValueKey(stopCode),
+          index: index,
+          child: Slidable(
+            key: Key(stopCode),
+            endActionPane: ActionPane(
+              motion: const DrawerMotion(),
+              extentRatio: 0.5,
+              children: [
+                SlidableAction(
+                  onPressed: (_) => _renameFavourite(stopCode, stopName),
+                  backgroundColor: _accent,
+                  foregroundColor: Colors.white,
+                  icon: Icons.edit,
+                  label: 'Rename',
+                ),
+                SlidableAction(
+                  onPressed: (_) => _deleteFavourite(stopCode),
+                  backgroundColor: Colors.red.shade700,
+                  foregroundColor: Colors.white,
+                  icon: Icons.delete,
+                  label: 'Delete',
+                ),
+              ],
+            ),
+            child: ListTile(
+              tileColor: _surface,
+              leading: const Icon(Icons.star, color: _accent, size: 20),
+              title: Text(stopCode,
+                  style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+              subtitle: Text(stopName, style: const TextStyle(color: Colors.white54, fontSize: 12)),
+              onTap: () => _openArrivals(stopCode, stopName),
+            ),
           ),
         );
       },
