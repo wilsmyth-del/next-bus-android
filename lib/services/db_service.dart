@@ -122,7 +122,7 @@ class DbService {
     final path = join(await getDatabasesPath(), 'next_bus.db');
     return openDatabase(
       path,
-      version: 4,
+      version: 5,
       onCreate: (db, v) async {
         await db.execute('''
           CREATE TABLE metadata (
@@ -134,7 +134,8 @@ class DbService {
           CREATE TABLE favourites (
             stop_code TEXT PRIMARY KEY,
             stop_name TEXT NOT NULL,
-            added_at  TEXT DEFAULT (datetime('now'))
+            added_at  TEXT DEFAULT (datetime('now')),
+            sort_order INTEGER
           )
         ''');
         // Built from the same definitions the import staging tables use, so a
@@ -212,6 +213,29 @@ class DbService {
             'CREATE INDEX IF NOT EXISTS idx_stop_times_stop ON stop_times(stop_id, departure_time)',
           );
         }
+        if (oldV < 5) {
+          // Slice F: favourites become hand-orderable. Seed sort_order from
+          // the order the list has displayed until now (added_at DESC) so the
+          // upgrade moves nothing on screen — the first drag is the first
+          // visible change.
+          await db.execute('ALTER TABLE favourites ADD COLUMN sort_order INTEGER');
+          final existing = await db.query(
+            'favourites',
+            columns: ['stop_code'],
+            orderBy: 'added_at DESC',
+          );
+          // Row by row in Dart rather than one UPDATE with a window function:
+          // ROW_NUMBER() needs SQLite 3.25+, which not every supported Android
+          // version ships, and this list is a handful of rows.
+          for (var i = 0; i < existing.length; i++) {
+            await db.update(
+              'favourites',
+              {'sort_order': i},
+              where: 'stop_code = ?',
+              whereArgs: [existing[i]['stop_code']],
+            );
+          }
+        }
       },
     );
   }
@@ -249,20 +273,40 @@ class DbService {
     return (count ?? 0) > 0;
   }
 
-  static Future<String?> getGtfsDate() async {
+  static Future<String?> getGtfsDate() => _metadata('gtfs_date');
+
+  /// When the last import actually succeeded, ISO-8601 local (#321 slice B2).
+  ///
+  /// Distinct from `gtfs_date`, which is the *feed's* date. The two answer
+  /// different questions — "how old is the schedule I am using" versus "when did
+  /// this phone last manage to update" — and a user staring at a stale feed date
+  /// cannot tell a feed that has not moved from downloads that have been failing.
+  static Future<String?> getGtfsUpdatedAt() => _metadata('gtfs_updated_at');
+
+  static Future<String?> _metadata(String key) async {
     final db = await database;
     final rows = await db.query(
       'metadata',
       where: 'key = ?',
-      whereArgs: ['gtfs_date'],
+      whereArgs: [key],
     );
     if (rows.isEmpty) return null;
     return rows.first['value'] as String?;
   }
 
+  /// Favourites in the user's hand-set order (slice F).
+  ///
+  /// `sort_order IS NULL` leads the ORDER BY so that a row which somehow
+  /// escaped the v5 migration sorts last rather than first — SQLite sorts
+  /// NULLs before everything else ascending, which would put an unpositioned
+  /// stop at the top of the list. `added_at DESC` breaks any tie, keeping the
+  /// pre-F behaviour as the fallback.
   static Future<List<Map<String, dynamic>>> getFavourites() async {
     final db = await database;
-    return db.query('favourites', orderBy: 'added_at DESC');
+    return db.query(
+      'favourites',
+      orderBy: 'sort_order IS NULL, sort_order, added_at DESC',
+    );
   }
 
   static Future<bool> isFavourite(String stopCode) async {
@@ -272,13 +316,67 @@ class DbService {
     return rows.isNotEmpty;
   }
 
+  /// Save a stop, or refresh the name of one already saved.
+  ///
+  /// This used to be a single `ConflictAlgorithm.replace` insert. With slice F
+  /// that is no longer safe: replacing the row drops its `sort_order`, so
+  /// re-starring a stop you had already placed would jerk it out of position.
+  /// So an existing row is updated in place and keeps both its position and
+  /// its `added_at`.
+  ///
+  /// A genuinely new stop goes on **top** (Wil, 2026-09-20): a new star has to
+  /// be visible, and appending to the bottom of a long hand-ordered list reads
+  /// as the star having failed. One below the current minimum is enough — the
+  /// order is relative, and the next drag renumbers densely anyway.
   static Future<void> addFavourite(String stopCode, String stopName) async {
     final db = await database;
-    await db.insert(
-      'favourites',
-      {'stop_code': stopCode, 'stop_name': stopName},
-      conflictAlgorithm: ConflictAlgorithm.replace,
-    );
+    await db.transaction((txn) async {
+      final existing = await txn.query(
+        'favourites',
+        columns: ['stop_code'],
+        where: 'stop_code = ?',
+        whereArgs: [stopCode],
+        limit: 1,
+      );
+      if (existing.isNotEmpty) {
+        await txn.update(
+          'favourites',
+          {'stop_name': stopName},
+          where: 'stop_code = ?',
+          whereArgs: [stopCode],
+        );
+        return;
+      }
+      final top = await txn.rawQuery('SELECT MIN(sort_order) AS m FROM favourites');
+      final minOrder = (top.first['m'] as num?)?.toInt();
+      await txn.insert('favourites', {
+        'stop_code': stopCode,
+        'stop_name': stopName,
+        'sort_order': (minOrder ?? 0) - 1,
+      });
+    });
+  }
+
+  /// Persist a whole new favourites order, top first, in one transaction.
+  ///
+  /// Renumbers densely from 0 on every drop, which also tidies the negative
+  /// values [addFavourite] leaves behind and any NULL that predates the
+  /// migration. Returns the number of rows it actually moved so the caller can
+  /// tell a silent no-op from a real write.
+  static Future<int> reorderFavourites(List<String> stopCodesTopFirst) async {
+    final db = await database;
+    var updated = 0;
+    await db.transaction((txn) async {
+      for (var i = 0; i < stopCodesTopFirst.length; i++) {
+        updated += await txn.update(
+          'favourites',
+          {'sort_order': i},
+          where: 'stop_code = ?',
+          whereArgs: [stopCodesTopFirst[i]],
+        );
+      }
+    });
+    return updated;
   }
 
   static Future<int> removeFavourite(String stopCode) async {
@@ -764,6 +862,14 @@ class DbService {
       await txn.insert(
         'metadata',
         {'key': 'gtfs_date', 'value': gtfsDate},
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+      // In the same transaction as the swap and the feed date, for the same
+      // reason: a recorded success that is not tied to the data landing is a
+      // recorded success that can lie.
+      await txn.insert(
+        'metadata',
+        {'key': 'gtfs_updated_at', 'value': DateTime.now().toIso8601String()},
         conflictAlgorithm: ConflictAlgorithm.replace,
       );
     });

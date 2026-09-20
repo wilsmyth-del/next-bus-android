@@ -9,6 +9,28 @@ class FeedInfo {
   const FeedInfo(this.url, this.date);
 }
 
+/// Why a schedule download is or is not on offer.
+enum UpdateStatus {
+  /// A newer feed than the stored one exists.
+  available,
+
+  /// A feed was found and it is the one already imported.
+  current,
+
+  /// No feed could be found at all — offline, or TransLink moved the files.
+  noFeed,
+}
+
+/// The outcome of [GtfsService.checkForUpdate].
+///
+/// [feed] is non-null for both [UpdateStatus.available] and
+/// [UpdateStatus.current], so a caller can name the date it found either way.
+class UpdateCheck {
+  final UpdateStatus status;
+  final FeedInfo? feed;
+  const UpdateCheck(this.status, this.feed);
+}
+
 class GtfsService {
   static String _urlFor(DateTime d) {
     final s =
@@ -54,13 +76,21 @@ class GtfsService {
     return null;
   }
 
-  // Returns non-null FeedInfo if an update is available, null if already current
-  static Future<FeedInfo?> checkForUpdate() async {
+  /// The single answer to "is there a newer schedule?" (#321 slice B2).
+  ///
+  /// This used to return a nullable FeedInfo, which forced every caller to
+  /// decide what null meant — and they disagreed. Settings re-derived
+  /// "already current" itself by comparing `_gtfsDate == feed.date`, while the
+  /// home path did not check at all and would happily re-download a feed it
+  /// already had. Two entrances, two answers, one of them wrong. Now there is
+  /// one function, it distinguishes the three real outcomes, and nobody
+  /// re-derives anything.
+  static Future<UpdateCheck> checkForUpdate() async {
     final latest = await findLatestFeed();
-    if (latest == null) return null;
+    if (latest == null) return const UpdateCheck(UpdateStatus.noFeed, null);
     final stored = await DbService.getGtfsDate();
-    if (stored == latest.date) return null;
-    return latest;
+    if (stored == latest.date) return UpdateCheck(UpdateStatus.current, latest);
+    return UpdateCheck(UpdateStatus.available, latest);
   }
 
   /// Guards against two imports running at once.

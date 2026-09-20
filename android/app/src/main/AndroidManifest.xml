@@ -1,6 +1,12 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- connectivity_plus declares this in its own manifest and Gradle merges it
+         in regardless, so the app ships with it either way. Declared here on
+         purpose: the shipped permission list should be readable in this file
+         rather than discovered in the Play Console. Used only to decide whether
+         a ~15 MB schedule download needs confirming (#321 slice B2). -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <application
         android:label="next_bus"
         android:name="${applicationName}"
