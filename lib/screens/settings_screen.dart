@@ -78,6 +78,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
       final feed = check.feed!;
       final kind = await ConnectivityGate.current();
+      // Guarded because the gate is an await away from a dialog: leave Settings
+      // while the connectivity check is in flight and showDialog would be
+      // handed a dead context. Not hypothetical on the slow path this sits on.
+      if (!mounted) return;
       if (ConnectivityGate.needsConfirmation(kind)) {
         final proceed = await _confirmMeteredDownload(kind);
         if (proceed != true) return;
