@@ -176,14 +176,16 @@ class _HomeScreenState extends State<HomeScreen> {
 
   /// Persist a drag. Optimistic like [_deleteFavourite]: the list moves first
   /// and rolls back whole if the write does not take.
+  ///
+  /// Wired to `onReorderItem` rather than the deprecated `onReorder`, and the
+  /// difference is who owns the off-by-one. `onReorder` hands over the raw drop
+  /// slot, which is one too far on every downward move because the dragged row
+  /// has not been lifted out yet — so every caller has to remember to subtract.
+  /// `onReorderItem` does that in the framework
+  /// (widgets/reorderable_list.dart:1022-1029) and skips the callback entirely
+  /// when the move is a no-op. Both of those now live in one place instead of
+  /// being re-derived here.
   Future<void> _reorderFavourites(int oldIndex, int newIndex) async {
-    // ReorderableListView reports newIndex as the slot the row would occupy
-    // *before* it is lifted out, so every downward move is reported one too
-    // far. This adjustment is the framework's documented contract, not a
-    // workaround.
-    if (newIndex > oldIndex) newIndex -= 1;
-    if (newIndex == oldIndex) return;
-
     // _favourites is already a growable copy (see _loadFavourites) — the #308
     // read-only-list bug is guarded there, and removeAt/insert rely on it.
     final previous = List<Map<String, dynamic>>.from(_favourites);
@@ -492,7 +494,7 @@ class _HomeScreenState extends State<HomeScreen> {
     // to get right (#308) and is not being asked to share an edge.
     return ReorderableListView.builder(
       itemCount: _favourites.length,
-      onReorder: _reorderFavourites,
+      onReorderItem: _reorderFavourites,
       buildDefaultDragHandles: false,
       itemBuilder: (context, index) {
         final fav = _favourites[index];

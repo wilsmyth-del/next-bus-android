@@ -12,13 +12,17 @@ class SettingsScreen extends StatefulWidget {
   State<SettingsScreen> createState() => _SettingsScreenState();
 }
 
-class _SettingsScreenState extends State<SettingsScreen> {
-  // Hoisted out of the widget tree rather than repeated as literals, which is
-  // what the rest of the app already does (home_screen.dart:20-22). Ten copies
-  // of a hex value is ten places to miss when one changes.
-  static const Color _surface = Color(0xFF1A1D27);
-  static const Color _accent = Color(0xFF60A5FA);
+// Hoisted out of the widget tree rather than repeated as literals, which is
+// what the rest of the app already does (home_screen.dart:20-22). Ten copies of
+// a hex value is ten places to miss when one changes.
+//
+// File-level rather than static on the State class: _Step at the bottom of this
+// file is a separate widget and uses the accent too, so a private static would
+// be out of scope exactly where it is needed.
+const Color _surface = Color(0xFF1A1D27);
+const Color _accent = Color(0xFF60A5FA);
 
+class _SettingsScreenState extends State<SettingsScreen> {
   final _controller = TextEditingController();
   bool _loading = true;
   bool _saved = false;
@@ -206,7 +210,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       style: TextStyle(color: Colors.white54, fontSize: 12),
                     ),
                     value: _liteMode,
-                    activeColor: _accent,
+                    activeThumbColor: _accent,
                     onChanged: (val) async {
                       await ApiKeyService.setLiteMode(val);
                       TranslinkService.clearCache();

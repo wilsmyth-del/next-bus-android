@@ -4,9 +4,11 @@
 WHAT THIS IS: a Python re-implementation of the three things slice F changed in
 lib/services/db_service.dart and lib/screens/home_screen.dart — the v5
 migration's seeding of sort_order, the read ordering, addFavourite's
-position-preserving upsert — plus the onReorder index arithmetic from
-home_screen. Run against real sqlite3 so the ordering can be exercised on the
-NUC, which has no Dart SDK (#311).
+position-preserving upsert — plus the drop handling in home_screen. It also
+models the slice of Flutter that sits between the user and that handler —
+onReorderItem's index adjustment — because the app's correctness depends on that
+contract and nothing else here checks it. Run against real sqlite3 so the
+ordering can be exercised on the NUC, which has no Dart SDK (#311).
 
 WHAT THIS IS NOT: a test of the shipped code. It is a second implementation and
 it CAN drift from the Dart. The Dart is authoritative. If you change the
@@ -81,15 +83,34 @@ def reorder_favourites(db, codes_top_first):
         updated += cur.rowcount
     return updated
 
-def on_reorder(order, old_index, new_index):
-    """home_screen's _reorderFavourites list arithmetic, local list only."""
+def framework_adjust(old_index, new_index):
+    """Flutter's _handleReorderItem, widgets/reorderable_list.dart:1022-1029.
+
+    Modelled because it is now the framework's job, not ours: onReorderItem
+    subtracts one from a downward move and suppresses the callback entirely when
+    the result is a no-op. Returns None when no callback would fire.
+    """
     if new_index > old_index:
         new_index -= 1
-    if new_index == old_index:
-        return list(order), False
+    return None if old_index == new_index else new_index
+
+def on_reorder_item(order, old_index, new_index):
+    """home_screen's _reorderFavourites, which now only moves the row.
+
+    Takes the ALREADY-ADJUSTED index the framework passes, so there is no
+    arithmetic left here to get wrong — which was the point of migrating off the
+    deprecated onReorder.
+    """
     out = list(order)
     out.insert(new_index, out.pop(old_index))
-    return out, True
+    return out
+
+def drop(order, old_index, raw_new_index):
+    """A full drop: the slot the user released over -> what the list becomes."""
+    adjusted = framework_adjust(old_index, raw_new_index)
+    if adjusted is None:
+        return list(order), False
+    return on_reorder_item(order, old_index, adjusted), True
 
 # ── the checks ────────────────────────────────────────────────────────────────
 
@@ -154,21 +175,31 @@ db.execute("INSERT INTO favourites (stop_code, stop_name, added_at, sort_order) 
            "VALUES ('Z','Stop Z','2026-06-01 00:00:00',NULL)")
 check("NULL sort_order goes to the bottom", get_favourites(db), ['B', 'A', 'Z'])
 
-print("7. onReorder index arithmetic")
+print("7. A drop lands where the user aimed (raw slot in, list out)")
 L = ['A', 'B', 'C', 'D']
-check("drag top to bottom (0 -> 4)", on_reorder(L, 0, 4)[0], ['B', 'C', 'D', 'A'])
-check("drag bottom to top (3 -> 0)", on_reorder(L, 3, 0)[0], ['D', 'A', 'B', 'C'])
-check("drag down one (0 -> 2)", on_reorder(L, 0, 2)[0], ['B', 'A', 'C', 'D'])
-check("drag up one (2 -> 1)", on_reorder(L, 2, 1)[0], ['A', 'C', 'B', 'D'])
-check("a no-op drop is detected (1 -> 2)", on_reorder(L, 1, 2), (L, False))
-check("a no-op drop the other way (1 -> 1)", on_reorder(L, 1, 1), (L, False))
+check("drag top to bottom (0 -> 4)", drop(L, 0, 4)[0], ['B', 'C', 'D', 'A'])
+check("drag bottom to top (3 -> 0)", drop(L, 3, 0)[0], ['D', 'A', 'B', 'C'])
+check("drag down one (0 -> 2)", drop(L, 0, 2)[0], ['B', 'A', 'C', 'D'])
+check("drag up one (2 -> 1)", drop(L, 2, 1)[0], ['A', 'C', 'B', 'D'])
+check("a no-op drop never reaches us (1 -> 2)", drop(L, 1, 2), (L, False))
+check("nor the other way (1 -> 1)", drop(L, 1, 1), (L, False))
+
+print("7b. The framework owns the off-by-one now, so check its contract")
+check("downward drops lose one", framework_adjust(0, 4), 3)
+check("upward drops are untouched", framework_adjust(3, 0), 0)
+check("a downward no-op is suppressed", framework_adjust(1, 2), None)
+check("an identical index is suppressed", framework_adjust(1, 1), None)
+# The handler is only ever handed an index it can use directly. If that ever
+# stops being true the failure is silent, and it lands in the user's order.
+check("the handler needs no arithmetic of its own",
+      on_reorder_item(L, 0, framework_adjust(0, 4)), ['B', 'C', 'D', 'A'])
 
 print("8. The local move and the persisted order agree")
 db = build_v4()
 for i, c in enumerate('ABCD'):
     star_v4(db, c, f'2026-01-0{i+1} 00:00:00')
 migrate_to_v5(db)                                 # D C B A
-local, changed = on_reorder(get_favourites(db), 0, 4)   # D to the bottom
+local, changed = drop(get_favourites(db), 0, 4)         # D to the bottom
 check("the drag changed something", changed, True)
 reorder_favourites(db, local)
 check("optimistic list matches what the DB returns", get_favourites(db), local)
