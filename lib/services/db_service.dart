@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
 
@@ -119,7 +121,7 @@ class DbService {
   }
 
   static Future<Database> _open() async {
-    final path = join(await getDatabasesPath(), 'next_bus.db');
+    final path = join(await getDatabasesPath(), _legacyDbName);
     return openDatabase(
       path,
       version: 5,
@@ -130,14 +132,7 @@ class DbService {
             value TEXT NOT NULL
           )
         ''');
-        await db.execute('''
-          CREATE TABLE favourites (
-            stop_code TEXT PRIMARY KEY,
-            stop_name TEXT NOT NULL,
-            added_at  TEXT DEFAULT (datetime('now')),
-            sort_order INTEGER
-          )
-        ''');
+        await db.execute('CREATE TABLE favourites ($_favouritesDdl)');
         // Built from the same definitions the import staging tables use, so a
         // staging table cannot drift from the table it is going to become.
         for (final t in _feedTables) {
@@ -294,6 +289,240 @@ class DbService {
     return rows.first['value'] as String?;
   }
 
+
+  // ---------------------------------------------------------------------------
+  // The profile store — slice G
+  //
+  // Favourites used to live in `next_bus.db`, alongside ~3.7M rows of
+  // `stop_times`. Android's Auto Backup has a 25MB per-app quota and skips an
+  // app **entirely** once it is over — so the schedule database was not merely
+  // failing to back itself up, it was taking the user's own data down with it.
+  // One fault, three faces: favourites lost on every reinstall, the TransLink
+  // API key lost with them (it lives in SharedPreferences, which the same sweep
+  // drops), and realtime silently dead ever after, because `_getFeed()` had no
+  // key left to send.
+  //
+  // Backup rules select **files**, not tables. So the fix is a second, small
+  // database holding nothing but the user's own rows: `res/xml/backup_rules.xml`
+  // and `res/xml/data_extraction_rules.xml` name this file and the shared-prefs
+  // domain and nothing else, and the schedule stops counting against the quota.
+  //
+  // The table definition below is deliberately byte-identical to the one in
+  // [_open]. That is what lets every favourites query in this class run
+  // unchanged against whichever database is currently authoritative — see
+  // [_favDb], which is the whole safety story of the migration.
+  // ---------------------------------------------------------------------------
+
+  static const String _legacyDbName = 'next_bus.db';
+  static const String _profileDbName = 'next_bus_profile.db';
+
+  static const String _migratedKey = 'favourites_migrated_at';
+  static const String _migratedCountKey = 'favourites_migrated_count';
+  static const String _migrationErrorKey = 'favourites_migration_error';
+
+  /// The shape of the favourites table, in one place, used by both databases.
+  static const String _favouritesDdl = '''
+    stop_code TEXT PRIMARY KEY,
+    stop_name TEXT NOT NULL,
+    added_at  TEXT DEFAULT (datetime('now')),
+    sort_order INTEGER
+  ''';
+
+  /// True once the copy into the profile store has been made *and verified*.
+  /// Until then every favourites read and write still goes to the old table —
+  /// the user's data is never in only one place at a time.
+  static bool _favouritesInProfile = false;
+
+  /// Shared across concurrent callers on purpose: this is the future, not the
+  /// database. Two screens asking for favourites at once must not each start
+  /// their own migration.
+  static Future<Database>? _profileOpening;
+
+  static Future<Database> get profileDatabase =>
+      _profileOpening ??= _openProfileOnce();
+
+  static Future<Database> _openProfileOnce() async {
+    try {
+      return await _openProfile();
+    } catch (_) {
+      // Let a later call try again rather than caching the failure for the
+      // lifetime of the process.
+      _profileOpening = null;
+      rethrow;
+    }
+  }
+
+  static Future<Database> _openProfile() async {
+    final path = join(await getDatabasesPath(), _profileDbName);
+    final db = await openDatabase(
+      path,
+      version: 1,
+      onConfigure: (db) async {
+        // DELETE journalling keeps every committed byte inside the single .db
+        // file. Android opens SQLite in WAL by default, which parks recent
+        // commits in a sibling `-wal` file that the backup rules do not name —
+        // so a backup could faithfully capture a database that is missing the
+        // user's most recent stars. This store is a handful of rows written a
+        // few times a day; there is nothing here that WAL was buying us.
+        await db.rawQuery('PRAGMA journal_mode = DELETE');
+      },
+      onCreate: (db, v) async {
+        await db.execute('CREATE TABLE favourites ($_favouritesDdl)');
+        await db.execute('''
+          CREATE TABLE profile_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+          )
+        ''');
+        // The store declares its own version, so an import in a later release
+        // can tell what it is reading rather than guessing from the columns.
+        await db.insert('profile_meta', {
+          'key': 'profile_format_version',
+          'value': '1',
+        });
+      },
+    );
+    await _adoptLegacyFavourites(db);
+    return db;
+  }
+
+  /// Copy the favourites out of `next_bus.db` exactly once, and only start
+  /// reading the new store when the copy has been counted back.
+  ///
+  /// The old table is **not** dropped. A release that both moves data and
+  /// destroys the only other copy of it has no way back if the move was wrong,
+  /// and the move cannot be tested on every device before it ships.
+  static Future<void> _adoptLegacyFavourites(Database profile) async {
+    try {
+      if (await _profileMeta(profile, _migratedKey) != null) {
+        _favouritesInProfile = true;
+        return;
+      }
+
+      final legacyPath = join(await getDatabasesPath(), _legacyDbName);
+      if (!await File(legacyPath).exists()) {
+        // A fresh install, or a restore that brought the profile store back
+        // without the schedule. There is nothing to copy and nothing to fall
+        // back to, so the new store is authoritative from birth.
+        await _finishMigration(profile, 0);
+        return;
+      }
+
+      final legacy = await database;
+      final rows = await legacy.query(
+        'favourites',
+        orderBy: 'sort_order IS NULL, sort_order, added_at DESC',
+      );
+
+      await profile.transaction((txn) async {
+        for (final row in rows) {
+          await txn.insert('favourites', {
+            'stop_code': row['stop_code'],
+            'stop_name': row['stop_name'],
+            'added_at': row['added_at'],
+            'sort_order': row['sort_order'],
+          }, conflictAlgorithm: ConflictAlgorithm.replace);
+        }
+        // Count the destination rather than trusting the loop. A short copy
+        // must fail the whole transaction, not leave a plausible-looking
+        // subset of someone's favourites behind.
+        final copied = Sqflite.firstIntValue(
+              await txn.rawQuery('SELECT COUNT(*) FROM favourites'),
+            ) ??
+            -1;
+        if (copied != rows.length) {
+          throw StateError(
+            'profile migration copied $copied of ${rows.length} favourites',
+          );
+        }
+        await txn.insert('profile_meta', {
+          'key': _migratedKey,
+          'value': DateTime.now().toIso8601String(),
+        }, conflictAlgorithm: ConflictAlgorithm.replace);
+        await txn.insert('profile_meta', {
+          'key': _migratedCountKey,
+          'value': '${rows.length}',
+        }, conflictAlgorithm: ConflictAlgorithm.replace);
+      });
+      _favouritesInProfile = true;
+    } catch (e) {
+      // Stay on the old table and say why. The failure mode this slice exists
+      // to end is data disappearing quietly; a migration that fails silently
+      // and shows an empty list would be the same bug wearing a new hat.
+      _favouritesInProfile = false;
+      try {
+        await profile.insert('profile_meta', {
+          'key': _migrationErrorKey,
+          'value': '${DateTime.now().toIso8601String()}: $e',
+        }, conflictAlgorithm: ConflictAlgorithm.replace);
+      } catch (_) {
+        // The store itself is unwritable; the fallback above is the answer.
+      }
+    }
+  }
+
+  static Future<void> _finishMigration(Database profile, int count) async {
+    await profile.insert('profile_meta', {
+      'key': _migratedKey,
+      'value': DateTime.now().toIso8601String(),
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
+    await profile.insert('profile_meta', {
+      'key': _migratedCountKey,
+      'value': '$count',
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
+    _favouritesInProfile = true;
+  }
+
+  static Future<String?> _profileMeta(Database profile, String key) async {
+    final rows = await profile.query(
+      'profile_meta',
+      columns: ['value'],
+      where: 'key = ?',
+      whereArgs: [key],
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    return rows.first['value'] as String?;
+  }
+
+  /// Whichever database currently owns the favourites.
+  ///
+  /// Both have the same table, so callers never learn which one answered. If
+  /// the profile store cannot be opened or its migration has not been verified,
+  /// this returns the original database and the app behaves exactly as it did
+  /// before this slice — degraded to "no automatic backup", never to "no
+  /// favourites".
+  static Future<Database> _favDb() async {
+    try {
+      final profile = await profileDatabase;
+      if (_favouritesInProfile) return profile;
+    } catch (_) {
+      // Fall through to the table that has always worked.
+    }
+    return database;
+  }
+
+  /// What the profile store thinks happened, for diagnostics and for slice E's
+  /// fresh-install checks. Never throws: a store that cannot be read reports
+  /// that it cannot be read.
+  static Future<Map<String, String?>> profileStatus() async {
+    try {
+      final profile = await profileDatabase;
+      return {
+        'in_profile_store': '$_favouritesInProfile',
+        'format_version': await _profileMeta(profile, 'profile_format_version'),
+        'migrated_at': await _profileMeta(profile, _migratedKey),
+        'migrated_count': await _profileMeta(profile, _migratedCountKey),
+        'migration_error': await _profileMeta(profile, _migrationErrorKey),
+      };
+    } catch (e) {
+      return {
+        'in_profile_store': 'false',
+        'migration_error': 'profile store unavailable: $e',
+      };
+    }
+  }
+
   /// Favourites in the user's hand-set order (slice F).
   ///
   /// `sort_order IS NULL` leads the ORDER BY so that a row which somehow
@@ -302,7 +531,7 @@ class DbService {
   /// stop at the top of the list. `added_at DESC` breaks any tie, keeping the
   /// pre-F behaviour as the fallback.
   static Future<List<Map<String, dynamic>>> getFavourites() async {
-    final db = await database;
+    final db = await _favDb();
     return db.query(
       'favourites',
       orderBy: 'sort_order IS NULL, sort_order, added_at DESC',
@@ -310,7 +539,7 @@ class DbService {
   }
 
   static Future<bool> isFavourite(String stopCode) async {
-    final db = await database;
+    final db = await _favDb();
     final rows = await db.query('favourites',
         where: 'stop_code = ?', whereArgs: [stopCode], limit: 1);
     return rows.isNotEmpty;
@@ -329,7 +558,7 @@ class DbService {
   /// as the star having failed. One below the current minimum is enough — the
   /// order is relative, and the next drag renumbers densely anyway.
   static Future<void> addFavourite(String stopCode, String stopName) async {
-    final db = await database;
+    final db = await _favDb();
     await db.transaction((txn) async {
       final existing = await txn.query(
         'favourites',
@@ -364,7 +593,7 @@ class DbService {
   /// migration. Returns the number of rows it actually moved so the caller can
   /// tell a silent no-op from a real write.
   static Future<int> reorderFavourites(List<String> stopCodesTopFirst) async {
-    final db = await database;
+    final db = await _favDb();
     var updated = 0;
     await db.transaction((txn) async {
       for (var i = 0; i < stopCodesTopFirst.length; i++) {
@@ -380,7 +609,7 @@ class DbService {
   }
 
   static Future<int> removeFavourite(String stopCode) async {
-    final db = await database;
+    final db = await _favDb();
     return db.delete('favourites',
         where: 'stop_code = ?', whereArgs: [stopCode]);
   }
@@ -876,7 +1105,7 @@ class DbService {
   }
 
   static Future<void> updateFavouriteName(String stopCode, String newName) async {
-    final db = await database;
+    final db = await _favDb();
     await db.update(
       'favourites',
       {'stop_name': newName},
