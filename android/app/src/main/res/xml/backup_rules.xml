@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Auto Backup rules for API 30 and below (android:fullBackupContent).
+
+  Why this file exists: Auto Backup has a 25MB per-app quota and, over it,
+  skips the app ENTIRELY rather than backing up what fits. `next_bus.db` holds
+  ~3.7M stop_times rows and blows that quota on its own, so nothing about this
+  app has ever been backed up — not the favourites, and not the TransLink API
+  key in SharedPreferences. That is the proven cause of favourites vanishing on
+  reinstall and of realtime going quietly dead afterwards (#321 slice G).
+
+  Naming any <include> makes inclusion exclusive: everything not listed here is
+  excluded, so the schedule database stops counting against the quota without
+  needing an <exclude> that would have to be kept in step with it.
+
+  The shared-prefs domain is taken whole rather than by filename. It contains
+  only this app's two preferences, and the plugin's file name is not ours to
+  depend on — an assumption here would be invisible until a restore failed.
+-->
+<full-backup-content>
+    <include domain="database" path="next_bus_profile.db" />
+    <include domain="sharedpref" path="." />
+</full-backup-content>
