@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  API 31+ replacement for backup_rules.xml (android:dataExtractionRules).
+  Both must exist: the platform picks by API level, and an app that ships only
+  one silently reverts to default behaviour on the other.
+
+  Keep the two files' contents in step. See backup_rules.xml for why the
+  schedule database is left out and why the shared-prefs domain is taken whole.
+
+  device-transfer carries no 25MB quota, so the schedule could in principle
+  travel with a device swap. It is deliberately left out anyway: it is ~200MB
+  of data the app can rebuild from TransLink in a few minutes, and a slow,
+  failure-prone transfer is a worse trade than one refresh on the new phone.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <include domain="database" path="next_bus_profile.db" />
+        <include domain="sharedpref" path="." />
+    </cloud-backup>
+    <device-transfer>
+        <include domain="database" path="next_bus_profile.db" />
+        <include domain="sharedpref" path="." />
+    </device-transfer>
+</data-extraction-rules>
