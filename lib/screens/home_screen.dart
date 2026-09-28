@@ -283,6 +283,12 @@ class _HomeScreenState extends State<HomeScreen> {
       MaterialPageRoute(builder: (_) => const SettingsScreen()),
     );
     if (!mounted) return;
+    // Settings can now change the favourites themselves, not just the schedule
+    // (slice G half 2 added profile import). Without this the list here is
+    // whatever it was before, and an import that worked perfectly reads as one
+    // that silently did nothing.
+    await _loadFavourites();
+    if (!mounted) return;
     try {
       final check = await GtfsService.checkForUpdate();
       if (mounted) {
