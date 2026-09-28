@@ -41,20 +41,63 @@ class GtfsService {
   static String _dateStr(DateTime d) =>
       '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
 
-  // Mirror server-side logic: recent Thursdays first, then daily fallback
+  /// How far back a plain day-by-day scan looks. A weekly feed is always
+  /// inside this window, so the scan finds the newest one without needing to
+  /// know which day of the week it lands on.
+  static const int _dailyScanDays = 14;
+
+  /// Only used once the daily scan has found nothing, which means nothing has
+  /// published in two weeks. Measured, not assumed — see [_candidates].
+  static const int _observedPublishWeekday = DateTime.friday;
+
+  /// Three, not two. The long-stop counts back from the most recent Friday,
+  /// and Friday is a day later in the week than the Thursday this replaced —
+  /// so matching weeks would have quietly reduced how far back the app can
+  /// still find a feed. Three weeks makes the reach 28-34 days, strictly
+  /// better than before, at the cost of one extra request in a case that only
+  /// arises when nothing has published in a fortnight.
+  static const int _longStopWeeks = 3;
+
+  /// Feed dates to try, newest first.
+  ///
+  /// This used to try four recent **Thursdays** before anything else, on the
+  /// belief that TransLink publishes weekly on a Thursday. Measured against the
+  /// live server on 2026-09-28, that belief is simply false, and had been
+  /// costing four guaranteed 404s on every single check:
+  ///
+  ///     2026-08-28 Fri 200      2026-09-10 Thu 404
+  ///     2026-09-04 Fri 200      2026-09-17 Thu 404
+  ///     2026-09-11 Fri 200      2026-09-24 Thu 404
+  ///     2026-09-18 Fri 200
+  ///     2026-09-25 Fri 200
+  ///
+  /// The daily fallback had been carrying the feature the whole time, which is
+  /// exactly why nothing ever looked broken. The fix is deliberately NOT to
+  /// swap one hard-coded weekday for another: a newest-first daily scan cannot
+  /// be wrong about the publication day at all, and a weekly feed is always
+  /// within a week of dates. The weekday survives only as a long-stop for the
+  /// abnormal case where nothing has published in a fortnight — where being
+  /// wrong costs two requests and no correctness.
+  ///
+  /// Dates are built with the `DateTime(y, m, d - n)` constructor rather than
+  /// `subtract(Duration(days: n))`. Duration arithmetic is absolute, so a
+  /// subtraction spanning a DST change lands at 23:00 on the previous day and
+  /// [_dateStr] then names the wrong date. The constructor normalises calendar
+  /// fields and is unaffected — it also rolls back over month and year ends.
   static Iterable<DateTime> _candidates() sync* {
-    final today = DateTime.now();
-    final daysSinceThursday = (today.weekday - 4) % 7;
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
     final seen = <String>{};
 
-    for (int i = 0; i < 4; i++) {
-      final d = today.subtract(Duration(days: daysSinceThursday + i * 7));
-      final date = DateTime(d.year, d.month, d.day);
+    for (int i = 0; i < _dailyScanDays; i++) {
+      final date = DateTime(today.year, today.month, today.day - i);
       if (seen.add(_dateStr(date))) yield date;
     }
-    for (int i = 0; i < 14; i++) {
-      final d = today.subtract(Duration(days: i));
-      final date = DateTime(d.year, d.month, d.day);
+
+    final daysSincePublishDay = (today.weekday - _observedPublishWeekday) % 7;
+    for (int w = 2; w < 2 + _longStopWeeks; w++) {
+      final date = DateTime(
+          today.year, today.month, today.day - (daysSincePublishDay + w * 7));
       if (seen.add(_dateStr(date))) yield date;
     }
   }
