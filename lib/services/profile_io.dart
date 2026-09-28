@@ -1,5 +1,3 @@
-import 'dart:convert';
-
 /// Reading and writing the portable profile file (#321 slice G, half 2).
 ///
 /// The file exists for two jobs that pull in different directions: carrying a
@@ -17,6 +15,8 @@ import 'dart:convert';
 /// belongs. Nothing stops a later `format_version` adding it if a real need
 /// turns up.
 library;
+
+import 'dart:convert';
 
 /// Bumped only when a reader must behave differently, not when a field is
 /// added. Readers ignore fields they do not know, so additions are free.
