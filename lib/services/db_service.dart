@@ -614,6 +614,71 @@ class DbService {
         where: 'stop_code = ?', whereArgs: [stopCode]);
   }
 
+  /// What an import actually did. Counts, not a bool: "imported successfully"
+  /// while silently dropping half the file is the failure this project keeps
+  /// meeting, so the caller is handed the numbers and has to show them.
+  static Future<ProfileImportOutcome> importProfile(
+    List<Map<String, dynamic>> rows, {
+    required bool replace,
+  }) async {
+    final db = await _favDb();
+    var added = 0, skipped = 0, removed = 0;
+
+    await db.transaction((txn) async {
+      if (replace) {
+        removed = await txn.delete('favourites');
+        for (var i = 0; i < rows.length; i++) {
+          await txn.insert('favourites', _rowFor(rows[i], i));
+          added++;
+        }
+        return;
+      }
+
+      final existing = await txn.query('favourites', columns: ['stop_code']);
+      final have = {for (final r in existing) r['stop_code'] as String};
+
+      // Merged stops land at the BOTTOM, keeping the file's relative order.
+      //
+      // This deliberately breaks slice F's "a new star goes on top" rule, and
+      // for the reason that rule exists: a single star has to be visible, so it
+      // goes where the eye is. An import is not one star — it is a handful at
+      // once, and putting them on top shoves the hand-ordered stops the user
+      // actually arranged down the screen. The user already knows an import
+      // happened; they do not need it announced by displacement.
+      final top =
+          await txn.rawQuery('SELECT MAX(sort_order) AS m FROM favourites');
+      // A NULL sort_order predates slice F and sorts last under
+      // [getFavourites]'s ORDER BY, so imported rows can appear above those.
+      // Only reachable on a database that somehow skipped the v5 seeding.
+      var next = ((top.first['m'] as num?)?.toInt() ?? -1) + 1;
+
+      for (final row in rows) {
+        if (have.contains(row['stop_code'])) {
+          skipped++;
+          continue;
+        }
+        await txn.insert('favourites', _rowFor(row, next++));
+        added++;
+      }
+    });
+
+    return ProfileImportOutcome(
+        added: added, skipped: skipped, removed: removed);
+  }
+
+  /// One row, ready to insert. `added_at` is omitted rather than written as
+  /// null when the file has none, so the column default supplies today instead
+  /// of the row carrying a NULL that sorts oddly for the rest of its life.
+  static Map<String, Object?> _rowFor(Map<String, dynamic> row, int order) {
+    final out = <String, Object?>{
+      'stop_code': row['stop_code'],
+      'stop_name': row['stop_name'],
+      'sort_order': order,
+    };
+    if (row['added_at'] is String) out['added_at'] = row['added_at'];
+    return out;
+  }
+
   /// How far ahead a schedule lookup reports. GTFS keeps post-midnight trips in
   /// the *previous* service day as "24:xx"/"25:xx", so with no horizon a stop
   /// whose last bus has already gone will cheerfully answer with tomorrow's
@@ -1152,6 +1217,25 @@ class ImportReport {
   String toString() =>
       '$stops stops, $routes routes, $trips trips, $stopTimes times, '
       'service match ${(serviceJoinRate * 100).toStringAsFixed(1)}%';
+}
+
+/// The result of [DbService.importProfile].
+class ProfileImportOutcome {
+  /// Stops written.
+  final int added;
+
+  /// Stops in the file that were already saved here, left exactly as they
+  /// were — their name and their hand-set position both (Wil, 2026-09-28).
+  final int skipped;
+
+  /// Stops cleared out first. Non-zero only on a replace.
+  final int removed;
+
+  const ProfileImportOutcome({
+    required this.added,
+    required this.skipped,
+    required this.removed,
+  });
 }
 
 /// Thrown when a downloaded feed fails its pre-swap checks. The live schedule is
