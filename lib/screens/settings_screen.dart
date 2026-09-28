@@ -1,9 +1,16 @@
+import 'dart:io';
+
+import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
+
 import '../services/api_key_service.dart';
 import '../services/connectivity_gate.dart';
 import '../services/translink_service.dart';
 import '../services/db_service.dart';
 import '../services/gtfs_service.dart';
+import '../services/profile_io.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -125,6 +132,133 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (age.inDays < 30) return '${age.inDays} days ago';
     return '${when.year}-${when.month.toString().padLeft(2, '0')}-'
         '${when.day.toString().padLeft(2, '0')}';
+  }
+
+  // ---------------------------------------------------------------------------
+  // Profile export / import — slice G half 2
+  //
+  // Half 1 already carries favourites and the API key through a reinstall via
+  // Auto Backup, so this is for everything that cannot reach: a different
+  // Google account, a phone with backup off, or handing a few stops to someone
+  // else. The key is deliberately NOT in the file (Wil, 2026-09-28) — an export
+  // is made to be shared.
+  // ---------------------------------------------------------------------------
+
+  bool _busyProfile = false;
+
+  Future<void> _exportProfile() async {
+    setState(() => _busyProfile = true);
+    try {
+      final favourites = await DbService.getFavourites();
+      if (favourites.isEmpty) {
+        _say('Nothing to export yet — star a stop first.');
+        return;
+      }
+      final now = DateTime.now();
+      final dir = await getTemporaryDirectory();
+      final file = File('${dir.path}/${ProfileIo.fileNameFor(now)}');
+      await file.writeAsString(ProfileIo.encode(favourites, now: now));
+
+      await SharePlus.instance.share(ShareParams(
+        files: [XFile(file.path, mimeType: 'application/json')],
+        fileNameOverrides: [ProfileIo.fileNameFor(now)],
+        subject: 'Next Bus favourites',
+        text: '${favourites.length} saved stops from Next Bus.',
+      ));
+    } catch (e) {
+      _say('Export failed: $e');
+    } finally {
+      if (mounted) setState(() => _busyProfile = false);
+    }
+  }
+
+  Future<void> _importProfile() async {
+    setState(() => _busyProfile = true);
+    try {
+      final picked = await openFile(acceptedTypeGroups: const [
+        XTypeGroup(
+          label: 'Next Bus profile',
+          extensions: ['json'],
+          // Android filters ACTION_OPEN_DOCUMENT by MIME type, not extension,
+          // so an extensions-only group offers the user nothing to pick.
+          mimeTypes: ['application/json'],
+        ),
+      ]);
+      if (picked == null) return; // cancelled — say nothing, nothing happened
+
+      final result = ProfileIo.decode(await picked.readAsString());
+      if (!result.isOk) {
+        _say(ProfileIo.describe(result.error!));
+        return;
+      }
+      if (!mounted) return;
+
+      final replace = await _confirmImportMode(result);
+      if (replace == null) return; // cancelled at the dialog
+      if (!mounted) return;
+
+      final outcome =
+          await DbService.importProfile(result.favourites, replace: replace);
+      _say(_describeOutcome(outcome, result.skippedRows));
+    } catch (e) {
+      _say('Import failed: $e');
+    } finally {
+      if (mounted) setState(() => _busyProfile = false);
+    }
+  }
+
+  /// true = replace, false = merge, null = cancelled.
+  ///
+  /// Asked rather than assumed, because the file serves two jobs that want
+  /// opposite answers: restoring your own phone wants replace, and a file a
+  /// friend sent you must not silently delete your stops. Merge is the default
+  /// and the only non-destructive choice, so a mis-tap costs nothing.
+  Future<bool?> _confirmImportMode(ProfileReadResult result) {
+    final n = result.favourites.length;
+    return showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: _surface,
+        title: const Text('Import profile',
+            style: TextStyle(color: Colors.white)),
+        content: Text(
+          '$n saved ${n == 1 ? 'stop' : 'stops'} in this file.'
+          '${result.skippedRows > 0 ? '\n\n${result.skippedRows} entries in the file could not be read and will be ignored.' : ''}'
+          '\n\nMerge keeps everything you already have. '
+          'Replace deletes your current favourites first.',
+          style: const TextStyle(color: Colors.white70),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel',
+                style: TextStyle(color: Colors.white54)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Replace mine',
+                style: TextStyle(color: Colors.redAccent)),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, false),
+            style: FilledButton.styleFrom(
+                backgroundColor: _accent, foregroundColor: Colors.black),
+            child: const Text('Merge'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Counts, in a sentence. An import that quietly drops half a file while
+  /// reporting success is the failure this whole slice is written against.
+  static String _describeOutcome(ProfileImportOutcome o, int unreadable) {
+    final parts = <String>[];
+    if (o.removed > 0) parts.add('${o.removed} replaced');
+    parts.add('${o.added} added');
+    if (o.skipped > 0) parts.add('${o.skipped} already saved');
+    if (unreadable > 0) parts.add('$unreadable unreadable');
+    return 'Imported: ${parts.join(', ')}.';
   }
 
   void _say(String message) {
@@ -324,6 +458,44 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     style: TextStyle(color: Colors.white38, fontSize: 12),
                   ),
                 ],
+                const SizedBox(height: 32),
+                const Text(
+                  'Your profile',
+                  style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16),
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  'Save your stops to a file, or load them from one. Useful for '
+                  'moving to a new phone, or sharing stops with someone else.',
+                  style: TextStyle(color: Colors.white54, fontSize: 13),
+                ),
+                const SizedBox(height: 4),
+                const Text(
+                  'Your API key is never included in this file.',
+                  style: TextStyle(color: Colors.white38, fontSize: 12),
+                ),
+                const SizedBox(height: 12),
+                OutlinedButton(
+                  onPressed: _busyProfile ? null : _exportProfile,
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.white70,
+                    side: const BorderSide(color: Colors.white24),
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    minimumSize: const Size(double.infinity, 0),
+                  ),
+                  child: const Text('Export favourites'),
+                ),
+                const SizedBox(height: 8),
+                OutlinedButton(
+                  onPressed: _busyProfile ? null : _importProfile,
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.white70,
+                    side: const BorderSide(color: Colors.white24),
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    minimumSize: const Size(double.infinity, 0),
+                  ),
+                  child: const Text('Import favourites'),
+                ),
                 const SizedBox(height: 32),
                 const Text(
                   'How to get a key',
