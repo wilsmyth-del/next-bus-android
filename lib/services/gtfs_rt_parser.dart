@@ -11,7 +11,6 @@ class GtfsRtArrival {
   final String stopId;
   final int arrivalTimestamp; // unix seconds (predicted)
   final int delaySeconds;
-  final bool hasGps;
 
   const GtfsRtArrival({
     required this.tripId,
@@ -19,22 +18,20 @@ class GtfsRtArrival {
     required this.stopId,
     required this.arrivalTimestamp,
     required this.delaySeconds,
-    required this.hasGps,
   });
 }
 
 class GtfsRtParser {
   static List<GtfsRtArrival> parse(Uint8List bytes) {
     final r = _Pb(bytes);
-    final tripUpdates  = <_TripUpdate>[];
-    final vehicleTrips = <String>{};
+    final tripUpdates = <_TripUpdate>[];
 
     while (r.hasMore) {
       final tag = r.varint();
       final f = tag >> 3;
       final w = tag & 7;
       if (f == 2 && w == 2) {
-        _parseEntity(r.bytes(), tripUpdates, vehicleTrips);
+        _parseEntity(r.bytes(), tripUpdates);
       } else {
         r.skip(w);
       }
@@ -42,7 +39,6 @@ class GtfsRtParser {
 
     final result = <GtfsRtArrival>[];
     for (final tu in tripUpdates) {
-      final hasGps = vehicleTrips.contains(tu.tripId);
       for (final s in tu.stops) {
         result.add(GtfsRtArrival(
           tripId:           tu.tripId,
@@ -50,24 +46,22 @@ class GtfsRtParser {
           stopId:           s.stopId,
           arrivalTimestamp: s.time,
           delaySeconds:     s.delay,
-          hasGps:           hasGps,
         ));
       }
     }
     return result;
   }
 
-  // FeedEntity: field 3 = TripUpdate, field 4 = VehiclePosition
-  static void _parseEntity(Uint8List b, List<_TripUpdate> tus, Set<String> vids) {
+  // FeedEntity: field 3 = TripUpdate. Field 4 (VehiclePosition) is skipped:
+  // TransLink's trip-updates feed carries none, so the old "has GPS" check
+  // could never be true and every realtime row showed as Approx (#321 C).
+  static void _parseEntity(Uint8List b, List<_TripUpdate> tus) {
     final r = _Pb(b);
     while (r.hasMore) {
       final tag = r.varint();
       final f = tag >> 3; final w = tag & 7;
       if (f == 3 && w == 2) {
         tus.add(_parseTripUpdate(r.bytes()));
-      } else if (f == 4 && w == 2) {
-        final vid = _parseVehicleTripId(r.bytes());
-        if (vid.isNotEmpty) vids.add(vid);
       } else {
         r.skip(w);
       }
@@ -135,18 +129,6 @@ class GtfsRtParser {
       else                       { r.skip(w); }
     }
     return (time, delay);
-  }
-
-  // VehiclePosition: field 1 = TripDescriptor → trip_id
-  static String _parseVehicleTripId(Uint8List b) {
-    final r = _Pb(b);
-    while (r.hasMore) {
-      final tag = r.varint();
-      final f = tag >> 3; final w = tag & 7;
-      if (f == 1 && w == 2) return _parseTripDescriptor(r.bytes()).$1;
-      r.skip(w);
-    }
-    return '';
   }
 }
 

@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'dart:io';
 import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 import '../config.dart';
@@ -10,7 +12,7 @@ class Arrival {
   final String destination;
   final int minutesAway;
   final String arrivalTime;
-  final String source; // 'live', 'approx', 'scheduled'
+  final String source; // 'live', 'scheduled'
   final int delaySeconds;
 
   /// True when this departure has already gone.
@@ -34,6 +36,23 @@ class Arrival {
 
 enum ArrivalMode { live, scheduled }
 
+/// Why a Now lookup came back schedule-only (#321 slice C).
+///
+/// Every one of these used to collapse into a bare `null` from `_getFeed`, and
+/// the app fell back to the timetable without a word — so a missing API key,
+/// a dead TransLink, and a phone with no signal all looked identical, and the
+/// missing key went unnoticed for weeks. [lite] is the user's own choice and
+/// is not a failure; the screen says nothing for it.
+enum LiveReason {
+  lite,
+  noKey,
+  rejected,     // 401 / 403
+  rateLimited,  // 429
+  serviceDown,  // 5xx
+  timedOut,     // no answer inside the timeout — TransLink slow, or weak signal
+  offline,      // could not connect at all
+  error,        // an unexpected status code, or a feed we could not read
+}
 class ArrivalResult {
   final List<Arrival> arrivals;
   final ArrivalMode mode;
@@ -46,8 +65,20 @@ class ArrivalResult {
   /// proved its data is present and valid.
   final Arrival? nextDeparture;
 
-  const ArrivalResult(this.arrivals, this.mode, {this.nextDeparture});
+  /// Set only when a Now lookup fell back to the schedule. Null when live, and
+  /// in Time mode, where schedule-only is the design rather than a failure.
+  final LiveReason? why;
+
+  /// The HTTP status behind [why], when there was one — shown raw, so a code we
+  /// did not anticipate is reported rather than guessed at.
+  final int? httpStatus;
+
+  const ArrivalResult(this.arrivals, this.mode,
+      {this.nextDeparture, this.why, this.httpStatus});
 }
+
+/// The live feed's bytes, or why there are none.
+typedef FeedFetch = ({Uint8List? bytes, LiveReason? why, int? status});
 
 class TranslinkService {
   static final Map<String, (ArrivalResult, DateTime)> _cache = {};
@@ -77,10 +108,18 @@ class TranslinkService {
 
     // Skip live feed entirely in lite mode
     final liteMode = await ApiKeyService.getLiteMode();
+    LiveReason why = LiveReason.lite;
+    int? status;
 
     // Try direct TransLink GTFS-RT
     if (!liteMode) try {
-      final feedBytes = await _getFeed(forceRefresh: forceRefresh);
+      final feed = await _getFeed(forceRefresh: forceRefresh);
+      // A feed that answered but holds nothing usable for this stop falls
+      // through as `error` with no status — "TransLink said 200" is not a
+      // reason, and showing it as one would be the screen lying.
+      why = feed.why ?? LiveReason.error;
+      status = feed.why == null ? null : feed.status;
+      final feedBytes = feed.bytes;
       if (feedBytes != null) {
         final stopRow = await DbService.lookupStop(stopCode);
         if (stopRow != null) {
@@ -112,7 +151,7 @@ class TranslinkService {
               destination:  '',
               minutesAway:  minutesAway < 0 ? 0 : minutesAway,
               arrivalTime:  arrivalTime,
-              source:       a.hasGps ? 'live' : 'approx',
+              source:       'live',
               delaySeconds: a.delaySeconds,
             ));
             liveTripIds.add(a.tripId);
@@ -146,9 +185,17 @@ class TranslinkService {
           return result;
         }
       }
+    } on TimeoutException {
+      why = LiveReason.timedOut;
+    } on SocketException {
+      why = LiveReason.offline;
+    } on http.ClientException {
+      // package:http's wrapper for a connection that never happened.
+      why = LiveReason.offline;
     } catch (e) {
       // ignore: avoid_print
       print('[TranslinkService] GTFS-RT failed: $e');
+      why = LiveReason.error;
     }
 
     // Fall back to on-device GTFS static schedule
@@ -165,6 +212,8 @@ class TranslinkService {
       arrivals,
       ArrivalMode.scheduled,
       nextDeparture: arrivals.isEmpty ? await _nextDepartureFor(stopCode) : null,
+      why: why,
+      httpStatus: status,
     );
     _cache[stopCode] = (result, DateTime.now());
     return result;
@@ -212,20 +261,33 @@ class TranslinkService {
     return ArrivalResult(arrivals, ArrivalMode.scheduled);
   }
 
-  static Future<Uint8List?> _getFeed({bool forceRefresh = false}) async {
+  /// Network failures are thrown, not returned: [getArrivals] sorts them by
+  /// exception type, which is the only place that distinction exists.
+  static Future<FeedFetch> _getFeed({bool forceRefresh = false}) async {
     if (!forceRefresh && _feedBytes != null && _feedFetchedAt != null &&
         DateTime.now().difference(_feedFetchedAt!) < _feedTtl) {
-      return _feedBytes;
+      return (bytes: _feedBytes, why: null, status: 200);
     }
     final apiKey = await ApiKeyService.getKey();
-    if (apiKey == null) return null;
+    if (apiKey == null) return (bytes: null, why: LiveReason.noKey, status: null);
     final url = Uri.parse('${Config.transitRtUrl}?apikey=$apiKey');
     final resp = await http.get(url).timeout(const Duration(seconds: 8));
-    if (resp.statusCode == 200) {
+    final why = classifyStatus(resp.statusCode);
+    if (why == null) {
       _feedBytes = resp.bodyBytes;
       _feedFetchedAt = DateTime.now();
-      return _feedBytes;
+      return (bytes: _feedBytes, why: null, status: 200);
     }
-    return null;
+    return (bytes: null, why: why, status: resp.statusCode);
+  }
+
+  /// Null means the feed answered and can be used. Pure, and mirrored in
+  /// tools/live_reason_model_test.py — change both in the same commit.
+  static LiveReason? classifyStatus(int code) {
+    if (code == 200) return null;
+    if (code == 401 || code == 403) return LiveReason.rejected;
+    if (code == 429) return LiveReason.rateLimited;
+    if (code >= 500 && code <= 599) return LiveReason.serviceDown;
+    return LiveReason.error;
   }
 }
