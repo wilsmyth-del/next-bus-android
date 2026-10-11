@@ -40,4 +40,8 @@ This isn't published to the Play Store. Grab the APK from the [Releases](../../r
 
 ## Privacy
 
-Your TransLink API key is stored locally on your device (SharedPreferences) and is never sent anywhere except directly to TransLink's API. The app does not collect or transmit any personal data.
+The app does not collect or transmit any personal data, and has no server of its own. Your TransLink API key is sent only to TransLink's API, to fetch live arrivals.
+
+Your saved stops and settings (including the API key) are stored on your device, and are included in Android's own backup — your Google account backup, and phone-to-phone transfer — so they survive a reinstall or a new phone. That is Android's backup, not ours; turn it off in your phone's backup settings if you prefer. The downloaded bus schedule is excluded and re-downloads from TransLink instead.
+
+Exporting your saved stops writes a file only to where you choose to save or share it.
