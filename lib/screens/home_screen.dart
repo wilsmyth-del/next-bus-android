@@ -452,6 +452,7 @@ class _HomeScreenState extends State<HomeScreen> {
     }
 
     return ListView.builder(
+      padding: EdgeInsets.only(bottom: MediaQuery.paddingOf(context).bottom),
       itemCount: _searchResults.length,
       itemBuilder: (context, index) {
         final stop = _searchResults[index];
@@ -498,7 +499,13 @@ class _HomeScreenState extends State<HomeScreen> {
     // Android handle sits on the right edge, which is exactly where
     // flutter_slidable's swipe-to-remove begins. That swipe took four rounds
     // to get right (#308) and is not being asked to share an edge.
+    // Android 15+ draws the app edge-to-edge, under the system nav bar, and
+    // leaves the inset to us (Wil, 2026-10-11: the last favourite sat under the
+    // bar until a throwaway stop was added below it). Padding the list rather
+    // than wrapping it in SafeArea keeps the list scrolling behind the bar
+    // while letting its last row scroll clear. Zero where there is no bar.
     return ReorderableListView.builder(
+      padding: EdgeInsets.only(bottom: MediaQuery.paddingOf(context).bottom),
       itemCount: _favourites.length,
       onReorderItem: _reorderFavourites,
       buildDefaultDragHandles: false,

@@ -242,6 +242,9 @@ class _ArrivalsScreenState extends State<ArrivalsScreen> {
               : _arrivals.isEmpty
                   ? Center(child: _buildEmptyState())
                   : ListView.builder(
+                      // Clear the system nav bar — see home_screen's favourites list.
+                      padding: EdgeInsets.only(
+                          bottom: MediaQuery.paddingOf(context).bottom),
                       itemCount: _arrivals.length,
                       itemBuilder: (context, i) => _buildRow(_arrivals[i]),
                     );
