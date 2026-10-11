@@ -325,7 +325,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       body: _loading
           ? const Center(child: CircularProgressIndicator(color: _accent))
           : ListView(
-              padding: const EdgeInsets.all(16),
+              // Clear the system nav bar — see home_screen's favourites list.
+              padding: EdgeInsets.fromLTRB(
+                  16, 16, 16, 16 + MediaQuery.paddingOf(context).bottom),
               children: [
                 const Text(
                   'Data usage',
