@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import '../services/translink_service.dart';
 import '../services/db_service.dart';
+import 'settings_screen.dart';
 
 class ArrivalsScreen extends StatefulWidget {
   final String stopCode;
@@ -23,6 +24,8 @@ class _ArrivalsScreenState extends State<ArrivalsScreen> {
   Arrival? _nextDeparture;
   bool _isFavourite = false;
   ArrivalMode _mode = ArrivalMode.live;
+  LiveReason? _why;
+  int? _httpStatus;
 
   /// null = Now. Non-null = Time mode, anchored here. Deliberately not
   /// persisted: every stop opens on Now, always. A stop that silently reopens
@@ -85,6 +88,8 @@ class _ArrivalsScreenState extends State<ArrivalsScreen> {
         _arrivals = filtered;
         _nextDeparture = result.nextDeparture;
         _mode = result.mode;
+        _why = result.why;
+        _httpStatus = result.httpStatus;
       });
     } catch (e) {
       if (mounted) setState(() {
@@ -204,7 +209,75 @@ class _ArrivalsScreenState extends State<ArrivalsScreen> {
       body: Column(
         children: [
           _buildModeStrip(),
+          _buildLiveNotice(),
           Expanded(child: _buildContent()),
+        ],
+      ),
+    );
+  }
+
+  /// The schedule-only notice, or null when there is nothing to say (#321 C).
+  ///
+  /// Pure, and mirrored in tools/live_reason_model_test.py — change both in the
+  /// same commit. A status code is shown raw wherever there is one: a code we
+  /// did not anticipate gets reported rather than guessed at.
+  static String? liveNotice(LiveReason? why, int? status) {
+    final code = status == null ? '' : ' ($status)';
+    return switch (why) {
+      null || LiveReason.lite => null,
+      LiveReason.noKey => 'Schedule only — no API key set',
+      LiveReason.rejected => 'Schedule only — API key rejected$code',
+      LiveReason.rateLimited =>
+        'Schedule only — TransLink rate limit$code, try again shortly',
+      LiveReason.serviceDown =>
+        'Schedule only — TransLink live service is down$code',
+      LiveReason.timedOut => "Schedule only — TransLink didn't answer in time",
+      LiveReason.offline => 'Schedule only — no connection',
+      LiveReason.error => status == null
+          ? "Schedule only — live data couldn't be read"
+          : 'Schedule only — unexpected response from TransLink$code',
+    };
+  }
+
+  Future<void> _openSettings() async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const SettingsScreen()),
+    );
+    // Settings clears the service cache when the key changes; force the feed
+    // too, so a key just entered is tried now rather than in 60 seconds.
+    if (mounted) await _load(forceRefresh: true);
+  }
+
+  /// Informational only (Wil, 2026-10-11) — the refresh button is the retry.
+  /// The one exception is a fix that lives in Settings, which gets a way there.
+  Widget _buildLiveNotice() {
+    if (_loading || _error != null || _planTime != null) {
+      return const SizedBox.shrink();
+    }
+    final text =
+        _mode == ArrivalMode.scheduled ? liveNotice(_why, _httpStatus) : null;
+    if (text == null) return const SizedBox.shrink();
+    final fixable = _why == LiveReason.noKey || _why == LiveReason.rejected;
+    return Container(
+      width: double.infinity,
+      color: const Color(0xFF2A2418),
+      padding: EdgeInsets.fromLTRB(16, fixable ? 2 : 10, fixable ? 4 : 16,
+          fixable ? 2 : 10),
+      child: Row(
+        children: [
+          const Icon(Icons.info_outline, size: 16, color: Colors.orangeAccent),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(text,
+                style: const TextStyle(color: Colors.white70, fontSize: 13)),
+          ),
+          if (fixable)
+            TextButton(
+              onPressed: _openSettings,
+              child: const Text('Settings',
+                  style: TextStyle(color: Color(0xFF60A5FA))),
+            ),
         ],
       ),
     );
@@ -316,16 +389,9 @@ class _ArrivalsScreenState extends State<ArrivalsScreen> {
     final planning = _planTime != null;
     final past = a.isPast;
 
-    final sourceColor = a.source == 'live'
-        ? Colors.greenAccent
-        : a.source == 'approx'
-            ? Colors.orangeAccent
-            : Colors.white38;
-    final sourceLabel = a.source == 'live'
-        ? 'Live'
-        : a.source == 'approx'
-            ? 'Approx'
-            : 'Scheduled';
+    final live = a.source == 'live';
+    final sourceColor = live ? Colors.greenAccent : Colors.white38;
+    final sourceLabel = live ? 'Live' : 'Scheduled';
 
     // Planning at noon for a 14:00 bus renders "120m" — true, useless, faintly
     // absurd. In Time mode the clock time is the answer and minutes-away is
