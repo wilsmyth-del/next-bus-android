@@ -181,7 +181,14 @@ class _Pb {
     switch (w) {
       case 0: while (_i < _b.length && (_b[_i++] & 0x80) != 0) {} break;
       case 1: _i += 8; break;
-      case 2: _i += varint(); break;
+      // Read the length FIRST. `_i += varint()` reads _i before varint()
+      // moves it past the length bytes, so every skipped field landed short
+      // and the parse drifted out of step — since the first commit, and
+      // invisibly until a feed drifted into a crash (#321 D, 10-17).
+      case 2:
+        final len = varint();
+        _i += len;
+        break;
       case 5: _i += 4; break;
     }
   }
