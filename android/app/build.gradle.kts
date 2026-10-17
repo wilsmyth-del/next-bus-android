@@ -1,7 +1,22 @@
+import java.io.FileInputStream
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
+}
+
+// Release signing (#321 D). key.properties lives beside this project on the
+// build machine and NEVER in git (android/.gitignore covers it and *.jks):
+//   storeFile=C:/Users/User/keys/next_bus_upload.jks
+//   storePassword=...
+//   keyAlias=upload
+//   keyPassword=...
+val keystorePropertiesFile = rootProject.file("key.properties")
+val keystoreProperties = Properties()
+if (keystorePropertiesFile.exists()) {
+    FileInputStream(keystorePropertiesFile).use { keystoreProperties.load(it) }
 }
 
 android {
@@ -25,11 +40,22 @@ android {
         versionName = flutter.versionName
     }
 
+    signingConfigs {
+        create("release") {
+            if (keystorePropertiesFile.exists()) {
+                storeFile = file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            // Never the debug key: Play refuses it, and a debug-signed release
+            // that works on the phone is exactly the quiet failure to avoid.
+            signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
@@ -45,4 +71,20 @@ kotlin {
 
 flutter {
     source = "../.."
+}
+
+// Fail loudly, and only for release builds: debug builds and `flutter run`
+// keep working on a machine without the key.
+gradle.taskGraph.whenReady {
+    val releaseBuild = allTasks.any {
+        (it.name.startsWith("assemble") || it.name.startsWith("bundle")) &&
+            it.name.endsWith("Release")
+    }
+    if (releaseBuild && !keystorePropertiesFile.exists()) {
+        throw GradleException(
+            "Release signing key not found: expected android/key.properties " +
+                "(see the comment at the top of android/app/build.gradle.kts). " +
+                "Release builds are never signed with the debug key.",
+        )
+    }
 }
