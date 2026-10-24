@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../services/api_key_service.dart';
 import '../services/translink_service.dart';
 import '../services/db_service.dart';
 import 'settings_screen.dart';
@@ -26,6 +27,7 @@ class _ArrivalsScreenState extends State<ArrivalsScreen> {
   ArrivalMode _mode = ArrivalMode.live;
   LiveReason? _why;
   int? _httpStatus;
+  bool _noKeyDismissed = false;
 
   /// null = Now. Non-null = Time mode, anchored here. Deliberately not
   /// persisted: every stop opens on Now, always. A stop that silently reopens
@@ -83,6 +85,7 @@ class _ArrivalsScreenState extends State<ArrivalsScreen> {
           }
         }
       }
+      final noKeyDismissed = await ApiKeyService.getNoKeyNoticeDismissed();
       if (mounted) setState(() {
         _loading = false;
         _arrivals = filtered;
@@ -90,6 +93,7 @@ class _ArrivalsScreenState extends State<ArrivalsScreen> {
         _mode = result.mode;
         _why = result.why;
         _httpStatus = result.httpStatus;
+        _noKeyDismissed = noKeyDismissed;
       });
     } catch (e) {
       if (mounted) setState(() {
@@ -221,11 +225,17 @@ class _ArrivalsScreenState extends State<ArrivalsScreen> {
   /// Pure, and mirrored in tools/live_reason_model_test.py — change both in the
   /// same commit. A status code is shown raw wherever there is one: a code we
   /// did not anticipate gets reported rather than guessed at.
-  static String? liveNotice(LiveReason? why, int? status) {
+  ///
+  /// Only the no-key notice can be dismissed: running without a key is a
+  /// choice, and saying so on every stop forever is nagging. A rejected key is
+  /// a fault the user did not choose, so it always shows.
+  static String? liveNotice(LiveReason? why, int? status,
+      {bool noKeyDismissed = false}) {
     final code = status == null ? '' : ' ($status)';
     return switch (why) {
       null || LiveReason.lite => null,
-      LiveReason.noKey => 'Schedule only — no API key set',
+      LiveReason.noKey =>
+        noKeyDismissed ? null : 'Schedule only — no API key set',
       LiveReason.rejected => 'Schedule only — API key rejected$code',
       LiveReason.rateLimited =>
         'Schedule only — TransLink rate limit$code, try again shortly',
@@ -255,10 +265,12 @@ class _ArrivalsScreenState extends State<ArrivalsScreen> {
     if (_loading || _error != null || _planTime != null) {
       return const SizedBox.shrink();
     }
-    final text =
-        _mode == ArrivalMode.scheduled ? liveNotice(_why, _httpStatus) : null;
+    final text = _mode == ArrivalMode.scheduled
+        ? liveNotice(_why, _httpStatus, noKeyDismissed: _noKeyDismissed)
+        : null;
     if (text == null) return const SizedBox.shrink();
     final fixable = _why == LiveReason.noKey || _why == LiveReason.rejected;
+    final dismissible = _why == LiveReason.noKey;
     return Container(
       width: double.infinity,
       color: const Color(0xFF2A2418),
@@ -277,6 +289,18 @@ class _ArrivalsScreenState extends State<ArrivalsScreen> {
               onPressed: _openSettings,
               child: const Text('Settings',
                   style: TextStyle(color: Color(0xFF60A5FA))),
+            ),
+          if (dismissible)
+            IconButton(
+              tooltip: "Don't show again",
+              visualDensity: VisualDensity.compact,
+              icon: const Icon(Icons.close, size: 18, color: Colors.white54),
+              // Hides the notice only. Lite mode is untouched, so a key added
+              // later goes live straight away.
+              onPressed: () async {
+                await ApiKeyService.dismissNoKeyNotice();
+                if (mounted) setState(() => _noKeyDismissed = true);
+              },
             ),
         ],
       ),

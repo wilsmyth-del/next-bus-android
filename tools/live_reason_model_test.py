@@ -4,7 +4,10 @@
 WHAT THIS IS: a Python re-implementation of what slice C added —
 TranslinkService.classifyStatus, the way getArrivals turns a feed fetch or a
 thrown exception into a LiveReason (and when it keeps the HTTP status), and
-ArrivalsScreen.liveNotice plus the rule for when the notice line shows at all.
+ArrivalsScreen.liveNotice plus the rule for when the notice line shows at all,
+and the no-key notice's "don't show again" (#321, agreed 10-17), which must
+hide that one notice and nothing else — in particular it must not switch Lite
+on, or a key added later would silently go unused.
 Run on the NUC, which has no Dart SDK (#311).
 
 WHAT THIS IS NOT: a test of the shipped code. It is a second implementation and
@@ -27,6 +30,7 @@ BREAKS = [
     "403-not-rejected", "5xx-boundary", "keep-200-status", "timeout-as-offline",
     "clientexc-as-error", "lite-shows", "time-mode-shows", "live-shows",
     "no-raw-code", "fixable-too-wide",
+    "dismiss-ignored", "dismiss-hides-rejected", "dismiss-sets-lite",
 ]
 
 passed = failed = 0
@@ -90,9 +94,12 @@ def get_arrivals(fetch):
 
 # ── model: ArrivalsScreen.liveNotice + _buildLiveNotice ─────────────────────
 
-def live_notice(why, status):
+def live_notice(why, status, dismissed=False):
     code = "" if status is None or BREAK == "no-raw-code" else f" ({status})"
     if why is None or (why == "lite" and BREAK != "lite-shows"):
+        return None
+    hidden = ("noKey", "rejected") if BREAK == "dismiss-hides-rejected" else ("noKey",)
+    if dismissed and why in hidden and BREAK != "dismiss-ignored":
         return None
     return {
         "lite": "Schedule only — lite mode",
@@ -106,12 +113,13 @@ def live_notice(why, status):
                   else f"Schedule only — unexpected response from TransLink{code}"),
     }[why]
 
-def notice_shown(mode, why, status, planning=False, loading=False, error=False):
+def notice_shown(mode, why, status, planning=False, loading=False, error=False,
+                 dismissed=False):
     if loading or error or (planning and BREAK != "time-mode-shows"):
         return None
     if mode != "scheduled" and BREAK != "live-shows":
         return None
-    return live_notice(why, status)
+    return live_notice(why, status, dismissed)
 
 def fixable(why):
     if BREAK == "fixable-too-wide":
@@ -121,6 +129,29 @@ def fixable(why):
 def screen(fetch, **kw):
     mode, why, status = get_arrivals(fetch)
     return notice_shown(mode, why, status, **kw), fixable(why)
+
+
+# ── model: the stored settings, and what a lookup does with them ────────────
+# ApiKeyService's prefs: the key, lite_mode, no_key_notice_dismissed.
+
+def fresh_install():
+    return {"key": None, "lite": False, "dismissed": False}
+
+def dismiss_no_key_notice(prefs):
+    prefs["dismissed"] = True
+    if BREAK == "dismiss-sets-lite":
+        prefs["lite"] = True
+
+def lookup(prefs, key_status=200):
+    """The notice a Now lookup shows for these prefs, and the mode it ends in."""
+    if prefs["lite"]:
+        fetch = ("lite",)
+    elif prefs["key"] is None:
+        fetch = ("nokey",)
+    else:
+        fetch = ("http", key_status, True)
+    mode, why, status = get_arrivals(fetch)
+    return notice_shown(mode, why, status, dismissed=prefs["dismissed"]), mode
 
 
 # ── checks ──────────────────────────────────────────────────────────────────
@@ -180,6 +211,21 @@ check("live data never gets a notice, even if a reason leaks through",
       notice_shown("live", "offline", None), None)
 check("hidden while loading", screen(("nokey",), loading=True)[0], None)
 check("hidden behind an error screen", screen(("nokey",), error=True)[0], None)
+
+print("don't show again")
+p = fresh_install()
+check("fresh install: the no-key notice shows",
+      lookup(p), ("Schedule only — no API key set", "scheduled"))
+dismiss_no_key_notice(p)
+check("dismissed: gone on the next stop", lookup(p), (None, "scheduled"))
+check("dismissing does NOT switch Lite on", p["lite"], False)
+p["key"] = "k"
+check("key added after dismissing: live straight away", lookup(p), (None, "live"))
+check("dismissed, then the key is rejected: that notice still shows",
+      lookup(p, key_status=403), ("Schedule only — API key rejected (403)", "scheduled"))
+check("dismissed hides nothing else: offline still shows",
+      notice_shown("scheduled", "offline", None, dismissed=True),
+      "Schedule only — no connection")
 
 print(f"\n{passed} passed, {failed} failed" + (f"  [BREAK={BREAK}]" if BREAK else ""))
 
