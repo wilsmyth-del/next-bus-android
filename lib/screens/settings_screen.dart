@@ -342,7 +342,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   child: SwitchListTile(
                     title: const Text('Lite mode', style: TextStyle(color: Colors.white)),
                     subtitle: const Text(
-                      'Block GTFS downloads and live arrivals on mobile data',
+                      'Turn off live arrivals and schedule downloads',
                       style: TextStyle(color: Colors.white54, fontSize: 12),
                     ),
                     value: _liteMode,
