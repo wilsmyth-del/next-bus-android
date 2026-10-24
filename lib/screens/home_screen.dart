@@ -197,14 +197,20 @@ class _HomeScreenState extends State<HomeScreen> {
           content: Text(n == 1
               ? 'Deleted ${_undoBatch.first['stop_code']}'
               : 'Deleted $n stops'),
-          duration: const Duration(seconds: 6),
+          // Stays until Undo or the ✕ (Wil, 10-24): an Undo you cannot miss,
+          // the same on every phone. The first build set only `duration`, and
+          // the bar never left — current Flutter keeps a bar with an action up
+          // unless told otherwise, so `persist` is set explicitly either way.
+          persist: true,
+          showCloseIcon: true,
           action: SnackBarAction(label: 'Undo', onPressed: _undoDeletes),
         ))
         .closed
         .then((reason) {
       if (reason != SnackBarClosedReason.hide &&
           reason != SnackBarClosedReason.action) {
-        _undoBatch.clear(); // timed out or swiped away: the deletes stand
+        // Closed with the ✕ or swiped away: the deletes stand.
+        _undoBatch.clear();
       }
     });
   }

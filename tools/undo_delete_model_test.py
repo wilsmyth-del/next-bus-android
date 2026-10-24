@@ -23,8 +23,8 @@ import os
 import sys
 
 BREAK = os.environ.get("BREAK", "")
-BREAKS = ["hide-ends-batch", "timeout-keeps-batch", "restore-drops-order",
-          "restore-replaces"]
+BREAKS = ["hide-ends-batch", "close-keeps-batch", "restore-drops-order",
+          "restore-replaces", "bar-times-out"]
 
 passed = failed = 0
 
@@ -96,7 +96,7 @@ class Home:
         ends = reason not in ("hide", "action")
         if BREAK == "hide-ends-batch":
             ends = reason != "action"
-        if BREAK == "timeout-keeps-batch":
+        if BREAK == "close-keeps-batch":
             ends = False
         if ends:
             self.batch.clear()
@@ -112,8 +112,14 @@ class Home:
         n = len(self.batch)
         self.bar = f"Deleted {self.batch[0]['stop_code']}" if n == 1 else f"Deleted {n} stops"
 
-    def timeout(self):
-        self._close_bar("timeout")
+    def wait(self):
+        # persist: true — the bar stays until Undo or the close icon (Wil,
+        # 10-24): an Undo that cannot be missed, the same on every phone.
+        if BREAK == "bar-times-out":
+            self._close_bar("timeout")
+
+    def close_with_x(self):                 # showCloseIcon
+        self._close_bar("dismiss")
 
     def swipe_bar_away(self):
         self._close_bar("swipe")
@@ -166,16 +172,25 @@ check("both back where they were", h.codes(), ORIGINAL)
 print("the bar ends the batch")
 h = fresh()
 h.delete("50001")
-h.timeout()
+h.wait()
+check("the bar stays however long you wait", h.bar, "Deleted 50001")
+check("…and Undo still works after the wait", h.undo(), 1)
+h = fresh()
+h.delete("50001")
+h.close_with_x()
 h.delete("50002")
-check("after a timeout the next bar counts only the new delete", h.bar, "Deleted 50002")
+check("after the close icon the next bar counts only the new delete", h.bar, "Deleted 50002")
 check("Undo then restores only that one", h.undo(), 1)
-check("the timed-out delete stands", h.codes(), ["50002", "50003", "50004"])
+check("the closed delete stands", h.codes(), ["50002", "50003", "50004"])
 h = fresh()
 h.delete("50003")
 h.swipe_bar_away()
 check("swiping the bar away also makes the delete final", h.undo(), None)
 check("…and the stop stays deleted", "50003" in h.codes(), False)
+h = fresh()
+h.delete("50003")
+h.close_with_x()
+check("the close icon makes the delete final", h.undo(), None)
 
 print("starred again before Undo")
 h = fresh()
