@@ -114,7 +114,7 @@ class Home:
 
     def wait(self):
         # persist: true — the bar stays until Undo or the close icon (Wil,
-        # 10-24). A timed bar never left on his phone, even with persist: false.
+        # 10-24): an Undo that cannot be missed, the same on every phone.
         if BREAK == "bar-times-out":
             self._close_bar("timeout")
 

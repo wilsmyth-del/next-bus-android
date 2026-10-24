@@ -197,11 +197,10 @@ class _HomeScreenState extends State<HomeScreen> {
           content: Text(n == 1
               ? 'Deleted ${_undoBatch.first['stop_code']}'
               : 'Deleted $n stops'),
-          // Stays until Undo or the ✕ (Wil, 10-24). A timed bar was tried
-          // twice and never left on his phone, even with `persist: false`.
-          // Unverified guess: Flutter keeps action bars up while an
-          // accessibility service is running. Either way, whether it times out
-          // is up to the device, and Undo must behave the same everywhere.
+          // Stays until Undo or the ✕ (Wil, 10-24): an Undo you cannot miss,
+          // the same on every phone. The first build set only `duration`, and
+          // the bar never left — current Flutter keeps a bar with an action up
+          // unless told otherwise, so `persist` is set explicitly either way.
           persist: true,
           showCloseIcon: true,
           action: SnackBarAction(label: 'Undo', onPressed: _undoDeletes),
