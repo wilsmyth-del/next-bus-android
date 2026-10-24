@@ -24,7 +24,7 @@ import sys
 
 BREAK = os.environ.get("BREAK", "")
 BREAKS = ["hide-ends-batch", "timeout-keeps-batch", "restore-drops-order",
-          "restore-replaces"]
+          "restore-replaces", "bar-persists"]
 
 passed = failed = 0
 
@@ -113,7 +113,14 @@ class Home:
         self.bar = f"Deleted {self.batch[0]['stop_code']}" if n == 1 else f"Deleted {n} stops"
 
     def timeout(self):
-        self._close_bar("timeout")
+        # Only because the bar sets persist: false. Current Flutter keeps a bar
+        # that has an action up forever by default and ignores `duration` —
+        # which is what the first device build did (10-24).
+        if BREAK != "bar-persists":
+            self._close_bar("timeout")
+
+    def close_with_x(self):                 # showCloseIcon
+        self._close_bar("dismiss")
 
     def swipe_bar_away(self):
         self._close_bar("swipe")
@@ -176,6 +183,14 @@ h.delete("50003")
 h.swipe_bar_away()
 check("swiping the bar away also makes the delete final", h.undo(), None)
 check("…and the stop stays deleted", "50003" in h.codes(), False)
+h = fresh()
+h.delete("50003")
+h.timeout()
+check("the bar really does time out (persist: false)", h.bar, None)
+h = fresh()
+h.delete("50003")
+h.close_with_x()
+check("the close icon makes the delete final", h.undo(), None)
 
 print("starred again before Undo")
 h = fresh()
