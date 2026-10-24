@@ -614,6 +614,25 @@ class DbService {
         where: 'stop_code = ?', whereArgs: [stopCode]);
   }
 
+  /// Put back rows exactly as [getFavourites] returned them — Undo on delete.
+  ///
+  /// Whole rows, so `sort_order` and `added_at` come back too and a restored
+  /// stop lands where it was rather than at the top. `ignore` on conflict: if
+  /// the stop was starred again before Undo, that newer row wins and is not
+  /// duplicated or moved. Returns how many rows actually went back.
+  static Future<int> restoreFavourites(List<Map<String, dynamic>> rows) async {
+    final db = await _favDb();
+    var restored = 0;
+    await db.transaction((txn) async {
+      for (final row in rows) {
+        final id = await txn.insert('favourites', Map<String, Object?>.from(row),
+            conflictAlgorithm: ConflictAlgorithm.ignore);
+        if (id > 0) restored++;
+      }
+    });
+    return restored;
+  }
+
   /// What an import actually did. Counts, not a bool: "imported successfully"
   /// while silently dropping half the file is the failure this project keeps
   /// meeting, so the caller is handed the numbers and has to show them.

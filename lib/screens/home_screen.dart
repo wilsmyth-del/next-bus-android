@@ -26,6 +26,9 @@ class _HomeScreenState extends State<HomeScreen> {
   List<Map<String, dynamic>> _favourites = [];
   FeedInfo? _pendingUpdate;
 
+  /// Favourites deleted while the current Undo bar is up, as whole rows.
+  final List<Map<String, dynamic>> _undoBatch = [];
+
   final TextEditingController _searchController = TextEditingController();
   List<Map<String, dynamic>> _searchResults = [];
 
@@ -163,12 +166,66 @@ class _HomeScreenState extends State<HomeScreen> {
             SnackBar(content: Text('Delete did not match any row for stop_code=$stopCode')),
           );
         }
+      } else {
+        _undoBatch.add(removed);
+        if (mounted) _showUndo();
       }
     } catch (e, st) {
       debugPrint('_deleteFavourite failed: $e\n$st');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Delete failed: $e')),
+        );
+      }
+    }
+  }
+
+  /// One Undo for every delete made while the bar is up (Wil, 10-11: two real
+  /// favourites went in a row while clearing dummies). A bar per delete would
+  /// replace the last one, and with it the only way back for the first stop.
+  ///
+  /// The delete itself has already happened; Undo puts rows back. So an app
+  /// killed mid-bar keeps what the user asked for rather than a ghost row.
+  void _showUndo() {
+    final n = _undoBatch.length;
+    final messenger = ScaffoldMessenger.of(context);
+    // Replacing the bar closes the old one as `hide` — that must not end the
+    // batch, or the second delete would cost the first its Undo.
+    messenger.hideCurrentSnackBar();
+    messenger
+        .showSnackBar(SnackBar(
+          content: Text(n == 1
+              ? 'Deleted ${_undoBatch.first['stop_code']}'
+              : 'Deleted $n stops'),
+          duration: const Duration(seconds: 6),
+          action: SnackBarAction(label: 'Undo', onPressed: _undoDeletes),
+        ))
+        .closed
+        .then((reason) {
+      if (reason != SnackBarClosedReason.hide &&
+          reason != SnackBarClosedReason.action) {
+        _undoBatch.clear(); // timed out or swiped away: the deletes stand
+      }
+    });
+  }
+
+  Future<void> _undoDeletes() async {
+    final rows = List<Map<String, dynamic>>.from(_undoBatch);
+    _undoBatch.clear();
+    try {
+      final restored = await DbService.restoreFavourites(rows);
+      await _loadFavourites();
+      if (restored < rows.length && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('Restored $restored of ${rows.length} — '
+              'the rest were already saved again'),
+        ));
+      }
+    } catch (e, st) {
+      debugPrint('_undoDeletes failed: $e\n$st');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Undo failed: $e')),
         );
       }
     }
